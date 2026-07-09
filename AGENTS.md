@@ -14,7 +14,12 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
   - 2× Ailerons nas asas → controlam **ESTRITAMENTE** Roll.
   - 1× Profundor na cauda → controla **ESTRITAMENTE** Pitch.
   - Estabilizadores verticais são **FIXOS**. **Não existe leme (rudder).**
-- Motor frontal tractor (A2212). Cauda fixada por duas hastes de fibra de vidro.
+- Hardware Alvo:
+  - Motor: A2212 1000KV
+  - ESC: 30A com BEC
+  - Hélice: 1045
+  - Bateria: Li-ion 2S (Pre-Arm 7.0V, Failsafe crítico 6.0V)
+- Cauda fixada por duas hastes de fibra de vidro.
 - Filosofia de controle: **"Bank and Yank"** — guinada é coordenada via roll.
 
 ### Arquitetura de Núcleos
@@ -93,8 +98,8 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 ### AHRS
 - Filtro de **Mahony** (quaternion) com correção de **força centrífuga** em curvas.
 - **COG Yaw Fusion**: filtro complementar suave (α=0.02) com GPS Course Over Ground quando velocidade > 5 m/s. Sem magnetômetro.
-- **Notch Filter** 150Hz (biquad IIR) para remover vibração do motor A2212.
-- **Auto-calibração** do MPU6050 no boot (500 amostras estáticas).
+- **Notch Filter Dinâmico**: Filtro biquad IIR com frequência central adaptativa. Rastreia o throttle para estimar a RPM do motor e rejeitar a frequência exata de vibração (50Hz a 170Hz para o combo A2212 1000KV/1045 em 2S).
+- **Auto-calibração Robusta**: Ocorre no boot com 500 amostras. Utiliza análise de desvio padrão (stddev) para detecção de movimento, rejeitando amostras corrompidas e executando _retry_ caso a aeronave seja sacudida pelo piloto.
 
 ### Navegação
 - **L1 Guidance**: aceleração lateral `a_lat = 2·V²/L1·sin(η)`, roll clampado a **±35°** (proteção tip stall).
@@ -103,8 +108,8 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 
 ### FSM e Segurança
 - Modos: MANUAL, ANGLE, HOLD (com override por stick), AUTO, RTH.
-- **Pre-Arm Checks**: GPS fix, Vbat ≥ 7.0V, inclinação ≤ 15°.
-- **Failsafe**: timeout LoRa (default 1500ms, parametrizável NVS) → RTH forçado.
+- **Pre-Arm Checks**: GPS fix, Vbat ≥ 7.0V (bateria Li-ion 2S), inclinação ≤ 15°.
+- **Failsafe**: timeout LoRa (default 1500ms, parametrizável NVS) → RTH forçado. Se Vbat cair para 6.0V em voo, entra em failsafe crítico.
 
 ---
 

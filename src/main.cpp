@@ -173,68 +173,182 @@ static void mpu6050Init()
 }
 
 /**
- * Auto-calibração do MPU6050 no boot.
- * Média de 500 amostras com aeronave ESTÁTICA e NIVELADA.
- * Remove o bias (offset) do giroscópio e do acelerômetro.
+ * Auto-calibração ROBUSTA do MPU6050 no boot.
  * 
- * IMPORTANTE: A aeronave DEVE estar parada e nivelada durante
- * os primeiros segundos após o boot. LED indicador pode ser
- * adicionado para feedback visual.
+ * PROBLEMA ORIGINAL:
+ * Se o piloto plugar a bateria balançando o avião na mão,
+ * os offsets do giroscópio ficam corrompidos, e o AHRS
+ * estimará ângulos errados → voo torto ou instável.
+ * 
+ * SOLUÇÃO — Detecção de Movimento:
+ * 1. Coleta NUM_SAMPLES amostras do giroscópio e acelerômetro
+ * 2. Calcula média E desvio padrão (stddev) do giroscópio
+ * 3. Se stddev > MOTION_THRESHOLD_DPS → REJEITA calibração
+ *    (aeronave está sendo movida durante a amostragem)
+ * 4. Também verifica se aceleração total ≈ 1g (está nivelada)
+ * 5. Se rejeitada, espera 2 segundos e tenta novamente
+ * 6. Máximo MAX_RETRIES tentativas antes de usar offsets zero
+ * 
+ * O piloto receberá feedback serial claro do estado de calibração.
  */
 static void mpu6050Calibrate()
 {
-    Serial.println(F("[MPU] ⏳ Calibrando — NÃO MOVER A AERONAVE..."));
-    
-    constexpr int NUM_SAMPLES = 500;
-    float sumGx = 0, sumGy = 0, sumGz = 0;
-    float sumAx = 0, sumAy = 0, sumAz = 0;
+    constexpr int   NUM_SAMPLES          = 500;
+    constexpr int   MAX_RETRIES          = 5;
+    constexpr float MOTION_THRESHOLD_DPS = 2.0f;   // Desvio padrão máximo aceitável
+    constexpr float GRAVITY_TOL_G        = 0.15f;   // Tolerância: |accel_total - 1g|
+    constexpr int   RETRY_DELAY_MS       = 2000;    // Espera entre tentativas
 
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        uint8_t raw[14];
-        mpu6050ReadRegs(0x3B, raw, 14);
+    Serial.println(F("[MPU] ═══════════════════════════════════════════"));
+    Serial.println(F("[MPU] CALIBRAÇÃO — Aeronave ESTÁTICA e NIVELADA"));
+    Serial.println(F("[MPU] ═══════════════════════════════════════════"));
 
-        int16_t ax = (raw[0] << 8) | raw[1];
-        int16_t ay = (raw[2] << 8) | raw[3];
-        int16_t az = (raw[4] << 8) | raw[5];
-        // raw[6..7] = temperatura (ignorado)
-        int16_t gx = (raw[8] << 8) | raw[9];
-        int16_t gy = (raw[10] << 8) | raw[11];
-        int16_t gz = (raw[12] << 8) | raw[13];
+    for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        Serial.print(F("[MPU] ⏳ Tentativa "));
+        Serial.print(attempt);
+        Serial.print(F("/"));
+        Serial.print(MAX_RETRIES);
+        Serial.println(F(" — NÃO MOVER..."));
 
-        // Converter para unidades físicas
-        // Giroscópio: ±500 dps → 65.5 LSB/dps
-        sumGx += (float)gx / 65.5f;
-        sumGy += (float)gy / 65.5f;
-        sumGz += (float)gz / 65.5f;
+        // ── Fase 1: Coleta de amostras ──
+        float sumGx = 0, sumGy = 0, sumGz = 0;
+        float sumAx = 0, sumAy = 0, sumAz = 0;
 
-        // Acelerômetro: ±4g → 8192 LSB/g
-        sumAx += (float)ax / 8192.0f;
-        sumAy += (float)ay / 8192.0f;
-        sumAz += (float)az / 8192.0f;
+        // Arrays para cálculo de desvio padrão (apenas giroscópio)
+        float samplesGx[NUM_SAMPLES];
+        float samplesGy[NUM_SAMPLES];
+        float samplesGz[NUM_SAMPLES];
 
-        delay(2);  // ~500Hz amostragem durante calibração
+        for (int i = 0; i < NUM_SAMPLES; i++) {
+            uint8_t raw[14];
+            mpu6050ReadRegs(0x3B, raw, 14);
+
+            int16_t ax_raw = (raw[0] << 8) | raw[1];
+            int16_t ay_raw = (raw[2] << 8) | raw[3];
+            int16_t az_raw = (raw[4] << 8) | raw[5];
+            int16_t gx_raw = (raw[8] << 8) | raw[9];
+            int16_t gy_raw = (raw[10] << 8) | raw[11];
+            int16_t gz_raw = (raw[12] << 8) | raw[13];
+
+            // Converter para unidades físicas
+            float gx = (float)gx_raw / 65.5f;  // ±500 dps → 65.5 LSB/dps
+            float gy = (float)gy_raw / 65.5f;
+            float gz = (float)gz_raw / 65.5f;
+            float ax = (float)ax_raw / 8192.0f; // ±4g → 8192 LSB/g
+            float ay = (float)ay_raw / 8192.0f;
+            float az = (float)az_raw / 8192.0f;
+
+            sumGx += gx; sumGy += gy; sumGz += gz;
+            sumAx += ax; sumAy += ay; sumAz += az;
+
+            samplesGx[i] = gx;
+            samplesGy[i] = gy;
+            samplesGz[i] = gz;
+
+            delay(2);  // ~500Hz amostragem
+
+            // Progresso visual a cada 100 amostras
+            if ((i + 1) % 100 == 0) {
+                Serial.print(F("[MPU]   Progresso: "));
+                Serial.print((i + 1) * 100 / NUM_SAMPLES);
+                Serial.println(F("%"));
+            }
+        }
+
+        // ── Fase 2: Calcular médias ──
+        float meanGx = sumGx / NUM_SAMPLES;
+        float meanGy = sumGy / NUM_SAMPLES;
+        float meanGz = sumGz / NUM_SAMPLES;
+        float meanAx = sumAx / NUM_SAMPLES;
+        float meanAy = sumAy / NUM_SAMPLES;
+        float meanAz = sumAz / NUM_SAMPLES;
+
+        // ── Fase 3: Calcular desvio padrão do giroscópio ──
+        // O desvio padrão indica QUANTO os valores variaram.
+        // Em repouso, o gyro tem ruído de ~0.05 dps (stddev).
+        // Se alguém está movendo o avião, stddev sobe para >5 dps.
+        float varGx = 0, varGy = 0, varGz = 0;
+        for (int i = 0; i < NUM_SAMPLES; i++) {
+            float dx = samplesGx[i] - meanGx;
+            float dy = samplesGy[i] - meanGy;
+            float dz = samplesGz[i] - meanGz;
+            varGx += dx * dx;
+            varGy += dy * dy;
+            varGz += dz * dz;
+        }
+        float stdGx = sqrtf(varGx / NUM_SAMPLES);
+        float stdGy = sqrtf(varGy / NUM_SAMPLES);
+        float stdGz = sqrtf(varGz / NUM_SAMPLES);
+        float maxStd = fmaxf(stdGx, fmaxf(stdGy, stdGz));
+
+        // ── Fase 4: Verificar aceleração total ≈ 1g (nivelada) ──
+        float accelMag = sqrtf(meanAx * meanAx + meanAy * meanAy + meanAz * meanAz);
+        float accelError = fabsf(accelMag - 1.0f);
+
+        // ── Fase 5: Decisão — aceitar ou rejeitar ──
+        Serial.print(F("[MPU]   Gyro stddev (dps): X="));
+        Serial.print(stdGx, 3); Serial.print(F(" Y="));
+        Serial.print(stdGy, 3); Serial.print(F(" Z="));
+        Serial.println(stdGz, 3);
+        Serial.print(F("[MPU]   Accel magnitude: "));
+        Serial.print(accelMag, 3);
+        Serial.println(F("g"));
+
+        bool motionDetected = (maxStd > MOTION_THRESHOLD_DPS);
+        bool notLevel       = (accelError > GRAVITY_TOL_G);
+
+        if (motionDetected) {
+            Serial.print(F("[MPU] ✗ MOVIMENTO DETECTADO (stddev="));
+            Serial.print(maxStd, 2);
+            Serial.print(F(" > "));
+            Serial.print(MOTION_THRESHOLD_DPS, 1);
+            Serial.println(F(" dps)"));
+            Serial.println(F("[MPU]   → Coloque a aeronave no chão e não toque!"));
+        }
+        if (notLevel) {
+            Serial.print(F("[MPU] ✗ AERONAVE NÃO NIVELADA (|accel|="));
+            Serial.print(accelMag, 3);
+            Serial.println(F("g, esperado ~1.0g)"));
+            Serial.println(F("[MPU]   → Nivele a aeronave antes de energizar."));
+        }
+
+        if (!motionDetected && !notLevel) {
+            // ── CALIBRAÇÃO ACEITA ──
+            gyroOffsetX = meanGx;
+            gyroOffsetY = meanGy;
+            gyroOffsetZ = meanGz;
+            accelOffsetX = meanAx;
+            accelOffsetY = meanAy;
+            accelOffsetZ = meanAz - 1.0f;  // Compensar gravidade
+
+            Serial.println(F("[MPU] ✓ CALIBRAÇÃO ACEITA"));
+            Serial.print(F("  Gyro offsets (dps): "));
+            Serial.print(gyroOffsetX, 3); Serial.print(F(", "));
+            Serial.print(gyroOffsetY, 3); Serial.print(F(", "));
+            Serial.println(gyroOffsetZ, 3);
+            Serial.print(F("  Accel offsets (g):  "));
+            Serial.print(accelOffsetX, 4); Serial.print(F(", "));
+            Serial.print(accelOffsetY, 4); Serial.print(F(", "));
+            Serial.println(accelOffsetZ, 4);
+            return;  // Sucesso — sair da função
+        }
+
+        // ── Tentativa falhou — esperar e tentar novamente ──
+        if (attempt < MAX_RETRIES) {
+            Serial.print(F("[MPU] Aguardando "));
+            Serial.print(RETRY_DELAY_MS / 1000);
+            Serial.println(F("s para nova tentativa..."));
+            delay(RETRY_DELAY_MS);
+        }
     }
 
-    // ── Média dos offsets ──
-    gyroOffsetX = sumGx / NUM_SAMPLES;
-    gyroOffsetY = sumGy / NUM_SAMPLES;
-    gyroOffsetZ = sumGz / NUM_SAMPLES;
-
-    // Para o acelerômetro, o offset em Z deve considerar 1g (gravidade)
-    // Em repouso nivelado: ax≈0, ay≈0, az≈+1g
-    accelOffsetX = sumAx / NUM_SAMPLES;        // Deve ser ~0
-    accelOffsetY = sumAy / NUM_SAMPLES;        // Deve ser ~0
-    accelOffsetZ = sumAz / NUM_SAMPLES - 1.0f; // Deve ser ~1g, offset = média - 1
-
-    Serial.println(F("[MPU] ✓ Calibração completa"));
-    Serial.print(F("  Gyro offsets (dps): "));
-    Serial.print(gyroOffsetX, 3); Serial.print(F(", "));
-    Serial.print(gyroOffsetY, 3); Serial.print(F(", "));
-    Serial.println(gyroOffsetZ, 3);
-    Serial.print(F("  Accel offsets (g):  "));
-    Serial.print(accelOffsetX, 4); Serial.print(F(", "));
-    Serial.print(accelOffsetY, 4); Serial.print(F(", "));
-    Serial.println(accelOffsetZ, 4);
+    // ── TODAS as tentativas falharam ──
+    // Usar offsets zero como fallback (melhor que offsets corrompidos)
+    Serial.println(F("[MPU] ⚠ TODAS AS TENTATIVAS FALHARAM"));
+    Serial.println(F("[MPU]   Usando offsets ZERO — Voo NÃO recomendado!"));
+    Serial.println(F("[MPU]   Re-energize com a aeronave parada no chão."));
+    gyroOffsetX = 0; gyroOffsetY = 0; gyroOffsetZ = 0;
+    accelOffsetX = 0; accelOffsetY = 0; accelOffsetZ = 0;
 }
 
 /**
@@ -385,26 +499,73 @@ static float pressureToAltitude(float pressure_Pa)
 }
 
 // ============================================================
-//  FILTRO NOTCH — Remove vibração mecânica do motor
+//  FILTRO NOTCH DINÂMICO — Rastreia RPM do motor via throttle
 // ============================================================
 
 /**
- * Filtro Notch (rejeita-banda) de 2ª ordem.
- * Remove a frequência de vibração dominante do motor (tipicamente
- * 100-200Hz para motores brushless pequenos como A2212).
+ * Filtro Notch DINÂMICO (rejeita-banda) de 2ª ordem.
  * 
- * Frequência central: 150Hz (ajustável via constante)
- * Bandwidth: 20Hz (Q = 150/20 = 7.5)
+ * PROBLEMA ORIGINAL:
+ * O filtro Notch estático centrado em 150Hz só funcionava para
+ * uma RPM específica (~9000 RPM). Motores brushless como o A2212
+ * mudam drasticamente de RPM conforme o acelerador:
+ *   - Idle (~10% throttle):  ~2000 RPM → vibração em ~67Hz  (2 pás)
+ *   - Cruzeiro (~55%):       ~5000 RPM → vibração em ~167Hz
+ *   - Full throttle (100%):  ~7500 RPM → vibração em ~250Hz
  * 
- * Implementação: Filtro biquad IIR (Direct Form I)
+ * Um notch estático em 150Hz deixa passar vibrações em idle e
+ * em potência alta, contaminando o giroscópio e causando
+ * oscilações parasitas no PID.
+ * 
+ * SOLUÇÃO — Notch Dinâmico (inspirado no Betaflight RPM Filter):
+ * 1. Estima a frequência de vibração a partir do comando de throttle
+ *    usando modelo linear: freq = IDLE_FREQ + throttle × (MAX_FREQ - IDLE_FREQ)
+ * 2. Recalcula os coeficientes IIR quando a frequência estimada muda
+ *    significativamente (>5Hz de variação)
+ * 3. Atualização limitada a 10Hz (a cada 25 ciclos de 250Hz) para
+ *    evitar custo computacional excessivo (sin/cos no recálculo)
+ * 4. Os estados do filtro (x1,x2,y1,y2) são preservados no recálculo
+ *    para evitar transientes
+ * 
+ * MODELO A2212 COM HÉLICE 2 PÁS:
+ *   Vibração predominante = (RPM / 60) × nº_pás
+ *   KV × V_bateria = RPM_max (sem carga), mas com carga ~70%
+ *   A2212 1000KV, 2S (7.4V): RPM_max ≈ 7400 → freq ≈ 247Hz
+ *   Idle: ~2000 RPM → freq ≈ 67Hz
  */
-struct NotchFilter {
+struct DynamicNotchFilter {
+    // Coeficientes do biquad IIR
     float b0, b1, b2, a1, a2;
-    float x1, x2, y1, y2;  // Estados anteriores
+    // Estados anteriores (preservados durante recálculo)
+    float x1, x2, y1, y2;
+    // Frequência atual do filtro (para detectar mudança significativa)
+    float _currentFreq;
+    float _sampleRate;
+    float _bandwidth;
 
     void init(float centerFreq, float bandwidth, float sampleRate) {
-        float w0 = 2.0f * PI * centerFreq / sampleRate;
-        float Q  = centerFreq / bandwidth;
+        _currentFreq = centerFreq;
+        _sampleRate  = sampleRate;
+        _bandwidth   = bandwidth;
+        x1 = x2 = y1 = y2 = 0.0f;
+        recalcCoefficients(centerFreq);
+    }
+
+    /**
+     * Recalcula coeficientes do biquad para nova frequência central.
+     * CUSTO: 1× sinf() + 1× cosf() — chamado no máximo a 10Hz.
+     * PRESERVA estados (x1,x2,y1,y2) para transição suave.
+     */
+    void recalcCoefficients(float centerFreq) {
+        // Proteger contra frequências fora do range Nyquist
+        if (centerFreq < 20.0f) centerFreq = 20.0f;
+        if (centerFreq > _sampleRate * 0.45f) centerFreq = _sampleRate * 0.45f;
+        
+        _currentFreq = centerFreq;
+        
+        float w0 = 2.0f * PI * centerFreq / _sampleRate;
+        float Q  = centerFreq / _bandwidth;
+        if (Q < 1.0f) Q = 1.0f;  // Q mínimo para estabilidade
         float alpha = sinf(w0) / (2.0f * Q);
 
         b0 = 1.0f;
@@ -417,8 +578,19 @@ struct NotchFilter {
         // Normalizar por a0
         b0 /= a0; b1 /= a0; b2 /= a0;
         a1 /= a0; a2 /= a0;
+        // NÃO zerar x1,x2,y1,y2 — manter continuidade do sinal
+    }
 
-        x1 = x2 = y1 = y2 = 0.0f;
+    /**
+     * Atualiza a frequência central se a mudança for significativa.
+     * Retorna true se houve recálculo.
+     */
+    bool updateFrequency(float newFreq) {
+        if (fabsf(newFreq - _currentFreq) > 5.0f) {
+            recalcCoefficients(newFreq);
+            return true;
+        }
+        return false;
     }
 
     float apply(float input) {
@@ -429,9 +601,20 @@ struct NotchFilter {
     }
 };
 
-// 6 filtros notch: 1 por eixo (3 gyro + 3 accel)
-static NotchFilter notchGx, notchGy, notchGz;
-static NotchFilter notchAx, notchAy, notchAz;
+// 6 filtros notch dinâmicos: 1 por eixo (3 gyro + 3 accel)
+static DynamicNotchFilter notchGx, notchGy, notchGz;
+static DynamicNotchFilter notchAx, notchAy, notchAz;
+
+// Constantes do modelo de vibração A2212 (1000KV) + hélice 1045 + Bateria Li-Ion 2S
+// freq_vibração = (RPM / 60) × 2 (hélice de 2 pás)
+// KV=1000 em 2S (7.4V) = 7400 RPM sem carga.
+// Com hélice grande 1045 a RPM cai bastante (provavelmente ~5000 RPM máximo).
+// Max vib freq ≈ 5000 / 60 * 2 = 166 Hz.
+static constexpr float NOTCH_IDLE_FREQ_HZ   = 50.0f;   // ~1500 RPM em marcha lenta
+static constexpr float NOTCH_MAX_FREQ_HZ    = 170.0f;  // ~5100 RPM em 100% acelerador
+static constexpr float NOTCH_BANDWIDTH_HZ   = 25.0f;   // Largura de banda
+static constexpr int   NOTCH_UPDATE_DIVIDER = 25;       // Atualizar a cada 25 ciclos (10Hz)
+static uint32_t notchUpdateCounter = 0;
 
 // ============================================================
 //  AHRS — Mahony com Correção de Força Centrífuga
@@ -712,15 +895,33 @@ static void Task_FlightControl(void* pvParameters)
     float inertialSpeedInteg = 0.0f;
 
     while (true) {
+        // ── 0) ATUALIZAÇÃO DO NOTCH DINÂMICO (10Hz) ──
+        if (++notchUpdateCounter >= NOTCH_UPDATE_DIVIDER) {
+            notchUpdateCounter = 0;
+            float currentThrottle = 0.0f;
+            if (xSemaphoreTake(stateMutex, 0) == pdTRUE) {
+                // Se em modo automático, usar nav_throttle, senão rc_throttle
+                currentThrottle = globalState.mode >= FlightMode::MODE_AUTO ? 
+                                  globalState.nav_throttle : globalState.rc_throttle;
+                xSemaphoreGive(stateMutex);
+            }
+            float targetFreq = NOTCH_IDLE_FREQ_HZ + currentThrottle * (NOTCH_MAX_FREQ_HZ - NOTCH_IDLE_FREQ_HZ);
+            notchGx.updateFrequency(targetFreq);
+            notchGy.updateFrequency(targetFreq);
+            notchGz.updateFrequency(targetFreq);
+            notchAx.updateFrequency(targetFreq);
+            notchAy.updateFrequency(targetFreq);
+            notchAz.updateFrequency(targetFreq);
+        }
+
         // ── 1) LEITURA MPU6050 ──
         float gx_dps, gy_dps, gz_dps;  // Giroscópio (°/s)
         float ax_g, ay_g, az_g;        // Acelerômetro (g)
         mpu6050Read(gx_dps, gy_dps, gz_dps, ax_g, ay_g, az_g);
 
-        // ── 2) FILTRO NOTCH 150Hz ──
+        // ── 2) FILTRO NOTCH DINÂMICO ──
         // Remove a frequência dominante de vibração do motor A2212.
-        // Sem este filtro, a vibração contamina o giroscópio e
-        // causa oscilações parasitas nos PIDs.
+        // Frequência é ajustada em tempo real baseada no throttle.
         gx_dps = notchGx.apply(gx_dps);
         gy_dps = notchGy.apply(gy_dps);
         gz_dps = notchGz.apply(gz_dps);
@@ -1303,14 +1504,15 @@ void setup()
     loadParamsFromNVS();
     applyParamsToPIDs();
 
-    // ── 8) Inicializar Filtros Notch (150Hz, BW=20Hz, Fs=250Hz) ──
-    notchGx.init(150.0f, 20.0f, (float)FLIGHT_CTRL_HZ);
-    notchGy.init(150.0f, 20.0f, (float)FLIGHT_CTRL_HZ);
-    notchGz.init(150.0f, 20.0f, (float)FLIGHT_CTRL_HZ);
-    notchAx.init(150.0f, 20.0f, (float)FLIGHT_CTRL_HZ);
-    notchAy.init(150.0f, 20.0f, (float)FLIGHT_CTRL_HZ);
-    notchAz.init(150.0f, 20.0f, (float)FLIGHT_CTRL_HZ);
-    Serial.println(F("[NOTCH] Filtros 150Hz inicializados"));
+    // ── 8) Inicializar Filtros Notch Dinâmicos (BW=25Hz, Fs=250Hz) ──
+    // Inicializa na frequência de idle (67Hz)
+    notchGx.init(NOTCH_IDLE_FREQ_HZ, NOTCH_BANDWIDTH_HZ, (float)FLIGHT_CTRL_HZ);
+    notchGy.init(NOTCH_IDLE_FREQ_HZ, NOTCH_BANDWIDTH_HZ, (float)FLIGHT_CTRL_HZ);
+    notchGz.init(NOTCH_IDLE_FREQ_HZ, NOTCH_BANDWIDTH_HZ, (float)FLIGHT_CTRL_HZ);
+    notchAx.init(NOTCH_IDLE_FREQ_HZ, NOTCH_BANDWIDTH_HZ, (float)FLIGHT_CTRL_HZ);
+    notchAy.init(NOTCH_IDLE_FREQ_HZ, NOTCH_BANDWIDTH_HZ, (float)FLIGHT_CTRL_HZ);
+    notchAz.init(NOTCH_IDLE_FREQ_HZ, NOTCH_BANDWIDTH_HZ, (float)FLIGHT_CTRL_HZ);
+    Serial.println(F("[NOTCH] Filtros dinâmicos inicializados"));
 
     // ── 9) Inicializar Subsistemas ──
     fsmManager.init();

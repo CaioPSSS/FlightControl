@@ -148,9 +148,9 @@ void FlightModeManager::checkFailsafe(const FlightState& state,
     // ════════════════════════════════════════════════════════
     //  FAILSAFE: BATERIA CRÍTICA EM VOO
     // ════════════════════════════════════════════════════════
-    // Se Vbat cai abaixo de 6.5V em voo (abaixo do pre-arm de 7.0V),
-    // forçar RTH para tentar pousar antes de brownout completo.
-    constexpr float VBAT_CRITICAL_INFLIGHT = 6.5f;
+    // Se Vbat cai abaixo de 6.0V em voo (Li-ion 2S, 3.0V por célula sob carga),
+    // a aeronave não terá energia para voar por muito mais tempo.
+    constexpr float VBAT_CRITICAL_INFLIGHT = 6.0f;
     if (state.vbat_V > 0.5f && state.vbat_V < VBAT_CRITICAL_INFLIGHT) {
         if (_failsafeState != FailsafeState::CRITICAL) {
             _failsafeState = FailsafeState::CRITICAL;
