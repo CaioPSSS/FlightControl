@@ -42,6 +42,11 @@ float PIDController::update(float setpoint, float measurement, float dt,
         return _lastOutput;
     }
 
+    // ── Proteção contra dados de sensor corrompidos ──
+    if (!isfinite(setpoint) || !isfinite(measurement)) {
+        return _lastOutput;
+    }
+
     float error = setpoint - measurement;
 
     // ════════════════════════════════════════════════════════

@@ -40,7 +40,8 @@ TECSController::TECSController()
       _pitchMax(25.0f),
       _altIntegral(0.0f),
       _altIntMax(10.0f),
-      _stallDetected(false)
+      _stallDetected(false),
+      _stallCounter(0)
 {
 }
 
@@ -56,7 +57,11 @@ void TECSController::update(float targetAlt_m, float targetSpeed_ms,
                             float dt,
                             float& pitchOut, float& throttleOut)
 {
-    if (dt <= 0.0f || dt > 1.0f) return;
+    if (dt <= 0.0f || dt > 1.0f) {
+        pitchOut = 0.0f;
+        throttleOut = _thrCruise;
+        return;
+    }
 
     // ════════════════════════════════════════════════════════
     //  1) ERROS DE ALTITUDE E VELOCIDADE
@@ -119,7 +124,11 @@ void TECSController::update(float targetAlt_m, float targetSpeed_ms,
         // Forçar throttle máximo para recuperação
         throttleOut = _thrMax;
         
-        Serial.println(F("[TECS] ⚠ ESTOL CONFIRMADO — Recuperação ativa"));
+        static uint32_t lastStallPrint = 0;
+        if (millis() - lastStallPrint > 2000) {
+            Serial.println(F("[TECS] ⚠ ESTOL CONFIRMADO — Recuperação ativa"));
+            lastStallPrint = millis();
+        }
     }
 
     // Clamp pitch aos limites estruturais
@@ -130,6 +139,7 @@ void TECSController::reset()
 {
     _altIntegral   = 0.0f;
     _stallDetected = false;
+    _stallCounter  = 0;
 }
 
 bool TECSController::detectStallHybrid(float groundSpeed_ms, float inertialSpeed_ms)
@@ -166,6 +176,12 @@ bool TECSController::detectStallHybrid(float groundSpeed_ms, float inertialSpeed
     bool gpsLowSpeed      = (groundSpeed_ms < STALL_SPEED_MS);
     bool inertialLowSpeed = (inertialSpeed_ms < STALL_SPEED_MS);
 
-    // Estol confirmado APENAS se ambas as fontes concordam
-    return (gpsLowSpeed && inertialLowSpeed);
+    if (gpsLowSpeed && inertialLowSpeed) {
+        if (_stallCounter < 250) _stallCounter++;
+    } else {
+        _stallCounter = 0;
+    }
+
+    // Estol confirmado APENAS se ambas as fontes concordam por 10 ciclos (200ms a 50Hz)
+    return (_stallCounter >= 10);
 }

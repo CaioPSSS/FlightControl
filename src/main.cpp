@@ -1072,6 +1072,7 @@ static void Task_FlightControl(void* pvParameters)
 
         // TPA (Throttle PID Attenuation)
         float tpaBrkpt = paramValues[(uint8_t)ParamID::TPA_BREAKPOINT];
+        if (tpaBrkpt >= 0.99f) tpaBrkpt = 0.99f;
         float tpaFactor = 1.0f;
         if (rcThrottle > tpaBrkpt) {
             // Atenuar Kp linearmente de 1.0 até 0.5 entre breakpoint e 100%
@@ -1255,8 +1256,8 @@ static void Task_Navigation(void* pvParameters)
             curLon = globalState.gps_lon;
             homeLat = globalState.home_lat;
             homeLon = globalState.home_lon;
-            homeAlt = globalState.home_alt_m;
-            homeSet = globalState.home_set;
+            homeAlt = globalState.home_baro_alt_m;
+            hasHome = globalState.home_set;
             curMode = globalState.mode;
             wpCurrent = globalState.wp_current;
             cogDeg = globalState.cogDeg;
@@ -1282,13 +1283,13 @@ static void Task_Navigation(void* pvParameters)
             float targetAlt = kalman_alt;  // Default: manter altitude atual
             float targetSpd = 12.0f;       // Default: 12 m/s
 
-            if (curMode == FlightMode::MODE_RTH && homeSet) {
+            if (curMode == FlightMode::MODE_RTH && hasHome) {
                 // ── RTH: orbitar sobre Home ──
                 navRoll = l1.updateLoiter(curLat, curLon,
                                           homeLat, homeLon,
                                           50.0f,  // raio 50m
                                           gsMs, cogDeg);
-                targetAlt = homeAlt + 30.0f;  // 30m acima de Home
+                targetAlt = homeAlt + 30.0f;  // 30m acima de Home (baro reference)
             } else if (curMode == FlightMode::MODE_AUTO && wpTarget.valid) {
                 // ── AUTO: seguir waypoints ──
                 double prevLatUse = wpPrev.valid ? wpPrev.lat : curLat;
@@ -1369,11 +1370,12 @@ static void Task_GPS(void* pvParameters)
                 globalState.groundSpeed_ms = gps.speed.mps();
                 globalState.cogDeg        = gps.course.deg();
 
-                // ── Gravar Home na primeira fixação ──
-                if (!globalState.home_set && globalState.gps_fix) {
+                // ── Gravar Home na primeira fixação (Sats >= 6 exigido) ──
+                if (!globalState.home_set && globalState.gps_fix && globalState.gps_sats >= 6) {
                     globalState.home_lat  = globalState.gps_lat;
                     globalState.home_lon  = globalState.gps_lon;
                     globalState.home_alt_m = globalState.gps_alt_m;
+                    globalState.home_baro_alt_m = kalman_alt;
                     globalState.home_set  = true;
                     Serial.println(F("[GPS] ✓ Home gravado"));
                 }
@@ -1574,11 +1576,11 @@ void setup()
         0
     );
 
-    // CORE 0: GPS (Async, Prio 3, Stack 2KB)
+    // CORE 0: GPS (Async, Prio 3, Stack 4KB)
     xTaskCreatePinnedToCore(
         Task_GPS,
         "GPS",
-        2048,
+        4096,
         NULL,
         3,
         NULL,

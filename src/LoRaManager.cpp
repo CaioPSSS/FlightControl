@@ -159,6 +159,10 @@ void LoRaManager::handleUplink(const uint8_t* data, int len)
     float rcThrottle = clampValue((float)pkt->throttle / 1000.0f, 0.0f, 1.0f);
 
     FlightMode reqMode = (FlightMode)pkt->mode;
+    if (pkt->mode > 4) {
+        Serial.println(F("[LORA] Modo inválido, ignorando pacote"));
+        return;
+    }
     bool reqArm = (pkt->arm != 0);
 
     // ── Atualizar globalState com mutex ──
@@ -235,8 +239,35 @@ void LoRaManager::handleTuning(const uint8_t* data, int len)
         return;
     }
 
+    // ── Validar valor recebido ──
+    if (!isfinite(pkt->value)) {
+        Serial.println(F("[LORA] Tuning: valor NaN/Inf rejeitado"));
+        return;
+    }
+
+    // Limites de segurança por parâmetro
+    static constexpr float PARAM_MAX[] = {
+        50.0f,   // ROLL_KP
+        20.0f,   // ROLL_KI
+        5.0f,    // ROLL_KD
+        5.0f,    // ROLL_FF
+        50.0f,   // PITCH_KP
+        20.0f,   // PITCH_KI
+        5.0f,    // PITCH_KD
+        5.0f,    // PITCH_FF
+        50.0f,   // ANGLE_KP
+        1.0f,    // THR_CRUISE
+        50.0f,   // L1_PERIOD
+        10000.0f,// LORA_TIMEOUT
+        0.99f,   // TPA_BREAKPOINT
+    };
+
+    float clampedValue = pkt->value;
+    if (clampedValue < 0.0f) clampedValue = 0.0f;
+    if (clampedValue > PARAM_MAX[pkt->paramId]) clampedValue = PARAM_MAX[pkt->paramId];
+
     // ── Aplicar em RAM (efeito imediato) ──
-    paramValues[pkt->paramId] = pkt->value;
+    paramValues[pkt->paramId] = clampedValue;
 
     // ── Agendar gravação NVS (será feita pela Task_System_Mon) ──
     nvsFlushPending = true;

@@ -88,7 +88,8 @@ private:
     float _altIntMax;     // Limite do integrador
     
     // Detecção de estol híbrida
-    bool  _stallDetected; // Flag de estol confirmado
+    bool    _stallDetected; // Flag de estol confirmado
+    uint8_t _stallCounter;  // Contador temporal para histerese
     
     /**
      * Detecção de estol com confirmação dupla (GPS + IMU).

@@ -292,16 +292,15 @@ struct FlightState {
     
     // --- GPS ---
     double gps_lat;       // Latitude (graus decimais)
-    double gps_lon;       // Longitude (graus decimais)
-    float  gps_alt_m;     // Altitude GPS (m, MSL)
-    uint8_t gps_sats;     // Satélites rastreados
+    float  home_lon;          // Longitude do Home
+    float  home_alt_m;        // Altitude do Home (MSL GPS)
+    float  home_baro_alt_m;   // Altitude barométrica (Kalman) no momento do Home set
+    bool   home_set;          // True se o home foi definidos
     bool   gps_fix;       // GPS tem fix 3D válido
     
     // --- Posição de Home (para RTH) ---
     double home_lat;
     double home_lon;
-    float  home_alt_m;
-    bool   home_set;      // Home foi gravado após primeiro fix
 
     // --- Missão (Waypoints) ---
     static constexpr uint8_t MAX_WAYPOINTS = 32;
@@ -392,17 +391,16 @@ inline T clampValue(T val, T lo, T hi) {
  * Necessário para cálculos de erro de heading (evita wrap-around).
  */
 inline float wrapAngle180(float angle) {
-    while (angle > 180.0f) angle -= 360.0f;
-    while (angle < -180.0f) angle += 360.0f;
-    return angle;
+    if (!isfinite(angle)) return 0.0f;
+    angle = fmodf(angle + 180.0f, 360.0f);
+    if (angle < 0.0f) angle += 360.0f;
+    return angle - 180.0f;
 }
 
-/**
- * Normaliza ângulo para o intervalo [0, 360) graus.
- */
 inline float wrapAngle360(float angle) {
-    while (angle >= 360.0f) angle -= 360.0f;
-    while (angle < 0.0f) angle += 360.0f;
+    if (!isfinite(angle)) return 0.0f;
+    angle = fmodf(angle, 360.0f);
+    if (angle < 0.0f) angle += 360.0f;
     return angle;
 }
 
