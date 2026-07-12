@@ -330,6 +330,7 @@ static void mpu6050Calibrate()
             Serial.print(accelOffsetX, 4); Serial.print(F(", "));
             Serial.print(accelOffsetY, 4); Serial.print(F(", "));
             Serial.println(accelOffsetZ, 4);
+            globalState.imu_calibrated = true;
             return;  // Sucesso — sair da função
         }
 
@@ -349,6 +350,7 @@ static void mpu6050Calibrate()
     Serial.println(F("[MPU]   Re-energize com a aeronave parada no chão."));
     gyroOffsetX = 0; gyroOffsetY = 0; gyroOffsetZ = 0;
     accelOffsetX = 0; accelOffsetY = 0; accelOffsetZ = 0;
+    globalState.imu_calibrated = false;
 }
 
 /**
@@ -993,6 +995,11 @@ static void Task_FlightControl(void* pvParameters)
         float navRollDeg = 0.0f, navPitchDeg = 0.0f, navThrottle = 0.0f;
         bool  mixerWasSaturated = false;
 
+        bool needsFailsafeCheck = false;
+        bool needsPidUpdate = false;
+        FlightMode reqMode = FlightMode::MODE_MANUAL;
+        bool reqArm = false;
+
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
             globalState.roll_deg      = roll_deg;
             globalState.pitch_deg     = pitch_deg;
@@ -1015,13 +1022,37 @@ static void Task_FlightControl(void* pvParameters)
             navPitchDeg  = globalState.nav_pitch_deg;
             navThrottle  = globalState.nav_throttle;
             mixerWasSaturated = globalState.mixerSaturated;
+
+            // Ler requisições
+            needsFailsafeCheck = globalState.request_failsafe;
+            globalState.request_failsafe = false;
+
+            needsPidUpdate = globalState.new_pid_gains;
+            globalState.new_pid_gains = false;
+
+            reqMode = (FlightMode)globalState.requested_mode;
+            reqArm  = globalState.requested_arm;
             
             xSemaphoreGive(stateMutex);
         }
 
-        // ── 5) FSM — Gerenciamento de Modo ──
-        bool armRequest = (currentArm == ArmState::ARMED);
+        // ── PROCESSAR FLAGS DE REQUISIÇÃO (Core 0 -> Core 1) ──
+        if (needsFailsafeCheck) {
+            FlightState localStateFailsafe;
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+                localStateFailsafe = globalState;
+                xSemaphoreGive(stateMutex);
+            }
+            fsmManager.checkFailsafe(localStateFailsafe,
+                                     rollRatePID, pitchRatePID,
+                                     rollAnglePID, pitchAnglePID);
+        }
 
+        if (needsPidUpdate) {
+            applyParamsToPIDs();
+        }
+
+        // ── 5) FSM — Gerenciamento de Modo ──
         // Copiar estado local para verificação da FSM
         FlightState localState;
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
@@ -1029,7 +1060,7 @@ static void Task_FlightControl(void* pvParameters)
             xSemaphoreGive(stateMutex);
         }
 
-        fsmManager.update(currentMode, armRequest, localState,
+        fsmManager.update(reqMode, reqArm, localState,
                           rollRatePID, pitchRatePID,
                           rollAnglePID, pitchAnglePID);
 
@@ -1378,11 +1409,6 @@ static void Task_LoRa(void* pvParameters)
         // ── Transmitir telemetria ──
         loraMgr.sendTelemetry();
 
-        // ── Aplicar parâmetros atualizados aos PIDs ──
-        // (Se tuning LoRa recebido neste ciclo)
-        if (nvsFlushPending) {
-            applyParamsToPIDs();
-        }
 
         vTaskDelayUntil(&xLastWakeTime, xPeriod);
     }
@@ -1415,16 +1441,7 @@ static void Task_System_Mon(void* pvParameters)
         FlightState localState;
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             localState = globalState;
-            xSemaphoreGive(stateMutex);
-        }
-        fsmManager.checkFailsafe(localState,
-                                  rollRatePID, pitchRatePID,
-                                  rollAnglePID, pitchAnglePID);
-
-        // Atualizar modo/failsafe no estado global
-        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            globalState.mode     = fsmManager.getCurrentMode();
-            globalState.failsafe = fsmManager.getFailsafeState();
+            globalState.request_failsafe = true;
             xSemaphoreGive(stateMutex);
         }
 

@@ -26,10 +26,12 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 - **Core 1**: Malha de controle atitudinal (250Hz, Prioridade 5). **NADA pode bloquear esta task.** Jitter alvo: < 100µs.
 - **Core 0**: Navegação (50Hz), GPS (async), LoRa (10Hz), System Monitor (1Hz).
 - **IPC**: Toda comunicação inter-tasks via `FlightState globalState` protegida por `stateMutex` (Mutex FreeRTOS).
+- **Regra de Mutabilidade Cruzada**: O Core 0 **NUNCA** deve chamar métodos que alterem o estado de objetos processados pelo Core 1 (como reset de PIDs ou atualizações diretas da FSM).
+- **Flags de Requisição**: A comunicação inter-núcleos baseia-se em *event flags* (`request_failsafe`, `new_pid_gains`, `requested_mode`, `requested_arm`). O Core 0 apenas altera estas flags no `FlightState`. O Core 1 (`Task_FlightControl`) lê estas flags e executa as ações necessárias sincronamente em sua malha.
 - Padrão de acesso ao estado global:
   ```cpp
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-      // Ler/escrever globalState
+      // Ler/escrever globalState e flags de requisição
       xSemaphoreGive(stateMutex);
   }
   ```
@@ -108,7 +110,7 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 
 ### FSM e Segurança
 - Modos: MANUAL, ANGLE, HOLD (com override por stick), AUTO, RTH.
-- **Pre-Arm Checks**: GPS fix, Vbat ≥ 7.0V (bateria Li-ion 2S), inclinação ≤ 15°.
+- **Pre-Arm Checks**: GPS fix, Vbat ≥ 7.0V (bateria Li-ion 2S), inclinação ≤ 15°, IMU auto-calibrada com sucesso.
 - **Failsafe**: timeout LoRa (default 1500ms, parametrizável NVS) → RTH forçado. Se Vbat cair para 6.0V em voo, entra em failsafe crítico.
 
 ---

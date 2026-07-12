@@ -344,6 +344,13 @@ struct FlightState {
     
     // --- Flags de saturação do mixer (para anti-windup PID) ---
     bool mixerSaturated;
+    
+    // --- Flags de Requisição IPC (Evita Race Conditions) ---
+    bool request_failsafe;   // Core 0 solicita que Core 1 avalie o failsafe
+    bool new_pid_gains;      // Core 0 sinaliza que novos ganhos PID chegaram
+    uint8_t requested_mode;  // Core 0 (LoRa) solicita novo modo (cast para FlightMode)
+    bool requested_arm;      // Core 0 (LoRa) solicita novo estado de armamento
+    bool imu_calibrated;     // Indica se a calibração inicial teve sucesso
 };
 
 // ============================================================

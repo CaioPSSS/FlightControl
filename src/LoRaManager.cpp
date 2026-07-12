@@ -166,22 +166,8 @@ void LoRaManager::handleUplink(const uint8_t* data, int len)
         globalState.rc_roll     = rcRoll;
         globalState.rc_pitch    = rcPitch;
         globalState.rc_throttle = rcThrottle;
-        xSemaphoreGive(stateMutex);
-    }
-
-    // ── Modo e Arm são processados pela FSM no Core 1 ──
-    // Armazenar temporariamente em variáveis acessíveis pela FSM
-    // (Feito via globalState - a FSM lê rc_roll/pitch/throttle e
-    //  o requestedMode/arm são passados na próxima iteração)
-    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-        // Armazenar pedido de modo/arm para a FSM processar
-        // A FSM lê estes campos no próximo ciclo de controle
-        globalState.mode = reqMode;       // Será validado pela FSM
-        if (reqArm) {
-            globalState.armState = ArmState::ARMED;  // Pedido, FSM valida
-        } else {
-            globalState.armState = ArmState::DISARMED;
-        }
+        globalState.requested_mode = (uint8_t)reqMode;
+        globalState.requested_arm  = reqArm;
         xSemaphoreGive(stateMutex);
     }
 }
@@ -254,6 +240,12 @@ void LoRaManager::handleTuning(const uint8_t* data, int len)
 
     // ── Agendar gravação NVS (será feita pela Task_System_Mon) ──
     nvsFlushPending = true;
+
+    // ── Sinalizar novos ganhos para o Core 1 ──
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        globalState.new_pid_gains = true;
+        xSemaphoreGive(stateMutex);
+    }
 
     Serial.print(F("[LORA] Tuning: "));
     Serial.print(PARAM_TABLE[pkt->paramId].nvsKey);

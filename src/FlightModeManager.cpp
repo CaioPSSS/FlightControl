@@ -200,6 +200,15 @@ bool FlightModeManager::runPreArmChecks(const FlightState& state)
         return false;
     }
 
+    // ════════════════════════════════════════════════════════
+    //  PRE-ARM CHECK 4: CALIBRAÇÃO DA IMU
+    // ════════════════════════════════════════════════════════
+    // A IMU deve ter concluído a auto-calibração com sucesso.
+    if (!state.imu_calibrated) {
+        _preArmFailReason = "IMU nao calibrada";
+        return false;
+    }
+
     // ── Todos os checks passaram ──
     _preArmFailReason = "OK";
     return true;
