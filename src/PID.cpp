@@ -27,7 +27,7 @@ PIDController::PIDController(float kp, float ki, float kd, float kff,
     : _kp(kp), _ki(ki), _kd(kd), _kff(kff),
       _outputMin(outputMin), _outputMax(outputMax),
       _iMax(iMax), _dCutoffHz(dCutoffHz),
-      _integral(0.0f), _prevError(0.0f), _dFiltered(0.0f),
+      _integral(0.0f), _prevMeasurement(0.0f), _dFiltered(0.0f),
       _lastP(0.0f), _lastI(0.0f), _lastD(0.0f),
       _lastFF(0.0f), _lastOutput(0.0f),
       _firstRun(true)
@@ -96,12 +96,13 @@ float PIDController::update(float setpoint, float measurement, float dt,
     // onde α = dt / (RC + dt), RC = 1/(2π×fc)
     if (_firstRun) {
         // Na primeira execução, inicializa sem spike
-        _prevError = error;
+        _prevMeasurement = measurement;
         _dFiltered = 0.0f;
         _firstRun = false;
         _lastD = 0.0f;
     } else {
-        float dRaw = (error - _prevError) / dt;
+        // S-02: Derivar a medição em vez do erro para evitar derivative kick
+        float dRaw = -(measurement - _prevMeasurement) / dt;
         
         // Coeficiente do filtro PT1
         float RC = 1.0f / (2.0f * PI * _dCutoffHz);
@@ -112,7 +113,7 @@ float PIDController::update(float setpoint, float measurement, float dt,
         
         _lastD = _dFiltered * _kd;
     }
-    _prevError = error;
+    _prevMeasurement = measurement;
 
     // ════════════════════════════════════════════════════════
     //  5) SOMATÓRIO E CLAMP DE SAÍDA
@@ -136,7 +137,7 @@ void PIDController::reset()
     // acumulado em MODE_ANGLE pode causar um pico de comando
     // ao transitar para MODE_MANUAL e voltar.
     _integral   = 0.0f;
-    _prevError  = 0.0f;
+    _prevMeasurement = 0.0f;
     _dFiltered  = 0.0f;
     _lastP      = 0.0f;
     _lastI      = 0.0f;

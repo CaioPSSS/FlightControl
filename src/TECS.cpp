@@ -36,8 +36,9 @@ TECSController::TECSController()
       _thrCruise(0.55f),
       _thrMin(0.0f),
       _thrMax(1.0f),
-      _pitchMin(-20.0f),
-      _pitchMax(25.0f),
+      // D-04: Spec Twin-Boom — deflexão >15° causa estol de cauda (Lh=43.3cm)
+      _pitchMin(-15.0f),
+      _pitchMax(15.0f),
       _altIntegral(0.0f),
       _altIntMax(10.0f),
       _stallDetected(false),

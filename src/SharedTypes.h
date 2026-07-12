@@ -88,7 +88,7 @@ static constexpr float PREARM_MIN_VBAT         = 7.0f;   // Volts
 static constexpr float PREARM_MAX_TILT_DEG     = 15.0f;  // Graus
 
 // TECS — Limite de estol com histerese
-static constexpr float STALL_SPEED_MS          = 9.5f;   // m/s
+static constexpr float STALL_SPEED_MS          = 8.5f;   // m/s
 
 // Velocidade mínima para fusão COG (Course Over Ground)
 static constexpr float MIN_COG_FUSION_SPEED    = 5.0f;   // m/s
@@ -291,16 +291,18 @@ struct FlightState {
     float cogDeg;         // Course Over Ground (GPS, graus)
     
     // --- GPS ---
-    double gps_lat;       // Latitude (graus decimais)
-    float  home_lon;          // Longitude do Home
-    float  home_alt_m;        // Altitude do Home (MSL GPS)
-    float  home_baro_alt_m;   // Altitude barométrica (Kalman) no momento do Home set
-    bool   home_set;          // True se o home foi definidos
-    bool   gps_fix;       // GPS tem fix 3D válido
+    double gps_lat;           // Latitude (graus decimais)
+    double gps_lon;           // Longitude (graus decimais)
+    float  gps_alt_m;         // Altitude GPS (m, MSL)
+    uint8_t gps_sats;         // Satélites rastreados
+    bool   gps_fix;           // GPS tem fix 3D válido
     
     // --- Posição de Home (para RTH) ---
     double home_lat;
     double home_lon;
+    float  home_alt_m;        // Altitude do Home (MSL GPS)
+    float  home_baro_alt_m;   // Altitude barométrica (Kalman) no momento do Home set
+    bool   home_set;          // True se o home foi definido
 
     // --- Missão (Waypoints) ---
     static constexpr uint8_t MAX_WAYPOINTS = 32;
@@ -350,6 +352,7 @@ struct FlightState {
     uint8_t requested_mode;  // Core 0 (LoRa) solicita novo modo (cast para FlightMode)
     bool requested_arm;      // Core 0 (LoRa) solicita novo estado de armamento
     bool imu_calibrated;     // Indica se a calibração inicial teve sucesso
+    bool baro_healthy;       // S-06: Indica se o barômetro BMP280 está saudável e respondendo
 };
 
 // ============================================================

@@ -30,6 +30,7 @@
 #include <TinyGPSPlus.h>
 
 #include "SharedTypes.h"
+#include <esp_task_wdt.h> // S-11: Hardware Watchdog Support
 #include "PID.h"
 #include "FlightModeManager.h"
 #include "StandardMixer.h"
@@ -49,9 +50,9 @@ SemaphoreHandle_t stateMutex = NULL;
 const ParamMeta PARAM_TABLE[] = {
     {"roll_kp",      4.5f },  // 0  - ROLL_KP
     {"roll_ki",      0.8f },  // 1  - ROLL_KI
-    {"roll_kd",      0.03f},  // 2  - ROLL_KD
+    {"roll_kd",      0.04f},  // 2  - ROLL_KD  (D-05: aumentado p/ estabilizar)
     {"roll_ff",      0.5f },  // 3  - ROLL_FF
-    {"pitch_kp",     5.0f },  // 4  - PITCH_KP
+    {"pitch_kp",     3.5f },  // 4  - PITCH_KP (D-05: reduzido 30% p/ evitar oscilação de cauda)
     {"pitch_ki",     1.0f },  // 5  - PITCH_KI
     {"pitch_kd",     0.04f},  // 6  - PITCH_KD
     {"pitch_ff",     0.6f },  // 7  - PITCH_FF
@@ -97,6 +98,7 @@ static float accelOffsetX = 0.0f, accelOffsetY = 0.0f, accelOffsetZ = 0.0f;
 // ── Estado do BMP280 ──
 static float bmp280_altRef_m = 0.0f;       // Altitude de referência (nível do solo)
 static bool  bmp280_refSet = false;
+static bool  bmp280_healthy = false;       // S-06: Saúde do barômetro
 
 // ── Kalman 1D para altitude (fusão baro + acelerômetro) ──
 static float kalman_alt = 0.0f;
@@ -427,6 +429,7 @@ static void bmp280Init()
     if (chipId != 0x58) {
         Serial.print(F("[BMP] ✗ Chip ID incorreto: 0x"));
         Serial.println(chipId, HEX);
+        bmp280_healthy = false;
         return;
     }
 
@@ -451,6 +454,7 @@ static void bmp280Init()
     bmp280WriteReg(0xF4, 0x2F);  // ctrl_meas: osrs_t=×2, osrs_p=×4, mode=normal
     bmp280WriteReg(0xF5, 0x0C);  // config: t_sb=0.5ms, filter=×4, spi3w_en=0
 
+    bmp280_healthy = true;
     Serial.println(F("[BMP] ✓ BMP280 inicializado"));
 }
 
@@ -460,6 +464,11 @@ static void bmp280Init()
  */
 static void bmp280Read(float& temperature, float& pressure)
 {
+    if (!bmp280_healthy) {
+        temperature = 0.0f;
+        pressure = 101325.0f; // Pressão padrão ao nível do mar
+        return;
+    }
     uint8_t data[6];
     bmp280ReadRegs(0xF7, data, 6);
 
@@ -597,6 +606,13 @@ struct DynamicNotchFilter {
 
     float apply(float input) {
         float output = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        // P-16: Guard NaN — coeficientes instáveis na transição de freq podem gerar NaN.
+        // Se detectado, resetar estado interno e passar o sinal direto (bypass seguro).
+        if (!isfinite(output)) {
+            output = input;
+            y1 = 0.0f; y2 = 0.0f;
+            x1 = 0.0f; x2 = 0.0f;
+        }
         x2 = x1; x1 = input;
         y2 = y1; y1 = output;
         return output;
@@ -890,6 +906,8 @@ static float readBatteryVoltage()
 static void Task_FlightControl(void* pvParameters)
 {
     (void)pvParameters;
+    // S-11: Registra esta task (FlightControl) no Task Watchdog
+    esp_task_wdt_add(NULL);
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xPeriod = pdMS_TO_TICKS(1000 / FLIGHT_CTRL_HZ);  // 4ms
 
@@ -1038,14 +1056,20 @@ static void Task_FlightControl(void* pvParameters)
 
         // ── PROCESSAR FLAGS DE REQUISIÇÃO (Core 0 -> Core 1) ──
         if (needsFailsafeCheck) {
-            FlightState localStateFailsafe;
+            // P-17: Inicializar com zeros para evitar lixo de stack se o mutex falhar.
+            FlightState localStateFailsafe = {};
+            bool gotFailsafeState = false;
             if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
                 localStateFailsafe = globalState;
+                gotFailsafeState = true;
                 xSemaphoreGive(stateMutex);
             }
-            fsmManager.checkFailsafe(localStateFailsafe,
-                                     rollRatePID, pitchRatePID,
-                                     rollAnglePID, pitchAnglePID);
+            // Só executa a checagem se conseguimos uma cópia válida do estado.
+            if (gotFailsafeState) {
+                fsmManager.checkFailsafe(localStateFailsafe,
+                                         rollRatePID, pitchRatePID,
+                                         rollAnglePID, pitchAnglePID);
+            }
         }
 
         if (needsPidUpdate) {
@@ -1074,9 +1098,11 @@ static void Task_FlightControl(void* pvParameters)
         float tpaBrkpt = paramValues[(uint8_t)ParamID::TPA_BREAKPOINT];
         if (tpaBrkpt >= 0.99f) tpaBrkpt = 0.99f;
         float tpaFactor = 1.0f;
-        if (rcThrottle > tpaBrkpt) {
+        // P-18: Usar throttle efetivo (navThr) nos modos autônomos, não o do stick
+        float actualThrottle = (activeMode >= FlightMode::MODE_HOLD) ? navThr : rcThrottle;
+        if (actualThrottle > tpaBrkpt) {
             // Atenuar Kp linearmente de 1.0 até 0.5 entre breakpoint e 100%
-            tpaFactor = 1.0f - 0.5f * (rcThrottle - tpaBrkpt) / (1.0f - tpaBrkpt);
+            tpaFactor = 1.0f - 0.5f * (actualThrottle - tpaBrkpt) / (1.0f - tpaBrkpt);
             if (tpaFactor < 0.5f) tpaFactor = 0.5f;
         }
 
@@ -1200,6 +1226,9 @@ static void Task_FlightControl(void* pvParameters)
             xSemaphoreGive(stateMutex);
         }
 
+        // S-11: Alimenta o Watchdog de Hardware
+        esp_task_wdt_feed();
+
         // ── Dormir até o próximo ciclo (250Hz timing preciso) ──
         vTaskDelayUntil(&xLastWakeTime, xPeriod);
     }
@@ -1215,6 +1244,8 @@ static void Task_FlightControl(void* pvParameters)
 static void Task_Navigation(void* pvParameters)
 {
     (void)pvParameters;
+    // S-11: Registra esta task (Navigation) no Task Watchdog
+    esp_task_wdt_add(NULL);
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xPeriod = pdMS_TO_TICKS(1000 / NAV_HZ);  // 20ms
 
@@ -1257,7 +1288,7 @@ static void Task_Navigation(void* pvParameters)
             homeLat = globalState.home_lat;
             homeLon = globalState.home_lon;
             homeAlt = globalState.home_baro_alt_m;
-            hasHome = globalState.home_set;
+            homeSet = globalState.home_set;
             curMode = globalState.mode;
             wpCurrent = globalState.wp_current;
             cogDeg = globalState.cogDeg;
@@ -1283,7 +1314,7 @@ static void Task_Navigation(void* pvParameters)
             float targetAlt = kalman_alt;  // Default: manter altitude atual
             float targetSpd = 12.0f;       // Default: 12 m/s
 
-            if (curMode == FlightMode::MODE_RTH && hasHome) {
+            if (curMode == FlightMode::MODE_RTH && homeSet) {
                 // ── RTH: orbitar sobre Home ──
                 navRoll = l1.updateLoiter(curLat, curLon,
                                           homeLat, homeLon,
@@ -1307,7 +1338,8 @@ static void Task_Navigation(void* pvParameters)
                 if (l1.waypointReached(curLat, curLon,
                                        wpTarget.lat, wpTarget.lon, 30.0f)) {
                     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-                        if (globalState.wp_current < globalState.wp_count - 1) {
+                        // P-22: Guard contra wp_count = 0 (underflow)
+                        if (globalState.wp_count > 0 && globalState.wp_current < globalState.wp_count - 1) {
                             globalState.wp_current++;
                         }
                         // Se último WP, manter loiter no ponto
@@ -1336,6 +1368,9 @@ static void Task_Navigation(void* pvParameters)
             globalState.nav_throttle   = navThr;
             xSemaphoreGive(stateMutex);
         }
+
+        // S-11: Alimenta o Watchdog de Hardware
+        esp_task_wdt_feed();
 
         vTaskDelayUntil(&xLastWakeTime, xPeriod);
     }
@@ -1460,11 +1495,12 @@ static void Task_System_Mon(void* pvParameters)
         Serial.print(F("[MON] Vbat="));
         Serial.print(vbat, 1);
         Serial.print(F("V Mode="));
-        Serial.print((uint8_t)fsmManager.getCurrentMode());
+        // P-19: Ler da cópia cross-core (localState) em vez de fsmManager
+        Serial.print((uint8_t)localState.mode);
         Serial.print(F(" Arm="));
-        Serial.print((uint8_t)fsmManager.getArmState());
+        Serial.print((uint8_t)localState.armState);
         Serial.print(F(" FS="));
-        Serial.print((uint8_t)fsmManager.getFailsafeState());
+        Serial.print((uint8_t)localState.failsafe);
         Serial.print(F(" GPS="));
         Serial.print(localState.gps_sats);
         Serial.print(F("sat Alt="));
@@ -1481,6 +1517,9 @@ static void Task_System_Mon(void* pvParameters)
 
 void setup()
 {
+    // S-11: Inicializar Watchdog de Hardware (timeout de 3s e pânico para reboot automático)
+    esp_task_wdt_init(3, true);
+    
     Serial.begin(115200);
     delay(500);
     Serial.println(F(""));
@@ -1496,34 +1535,41 @@ void setup()
     analogSetAttenuation(ADC_11db);
     pinMode(PIN_VBAT_ADC, INPUT);
 
-    // ── 2) Inicializar I2C Fast (Core 1 — MPU6050) ──
+    // ── 2) Inicializar FlightState (ANTES da calibração para não destruir flags) ──
+    memset(&globalState, 0, sizeof(FlightState));
+    globalState.mode     = FlightMode::MODE_MANUAL;
+    globalState.armState = ArmState::DISARMED;
+    globalState.failsafe = FailsafeState::NOMINAL;
+
+    // ── 3) Inicializar I2C Fast (Core 1 — MPU6050) ──
     Wire.begin(PIN_I2C_FAST_SDA, PIN_I2C_FAST_SCL);
     Wire.setClock(I2C_FAST_FREQ);
     mpu6050Init();
     mpu6050Calibrate();  // Auto-calibração (500 amostras estáticas)
 
-    // ── 3) Inicializar I2C Slow (Core 0 — BMP280) ──
+    // ── 4) Inicializar I2C Slow (Core 0 — BMP280) ──
     I2C_Slow.begin(PIN_I2C_SLOW_SDA, PIN_I2C_SLOW_SCL);
     I2C_Slow.setClock(I2C_SLOW_FREQ);
     bmp280Init();
+    globalState.baro_healthy = bmp280_healthy;
 
-    // ── 4) Inicializar UART GPS ──
+    // ── 5) Inicializar UART GPS ──
     SerialGPS.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
     Serial.println(F("[GPS] UART2 inicializado (9600 baud)"));
 
-    // ── 5) Inicializar LoRa ──
+    // ── 6) Inicializar LoRa ──
     if (!loraMgr.init()) {
         Serial.println(F("[FATAL] LoRa falhou! Sistema continuará sem link."));
     }
 
-    // ── 6) Inicializar Saídas PWM (LEDC) ──
+    // ── 7) Inicializar Saídas PWM (LEDC) ──
     outputMgr.init();
 
-    // ── 7) Inicializar NVS — Carregar parâmetros persistidos ──
+    // ── 8) Inicializar NVS — Carregar parâmetros persistidos ──
     loadParamsFromNVS();
     applyParamsToPIDs();
 
-    // ── 8) Inicializar Filtros Notch Dinâmicos (BW=25Hz, Fs=250Hz) ──
+    // ── 9) Inicializar Filtros Notch Dinâmicos (BW=25Hz, Fs=250Hz) ──
     // Inicializa na frequência de idle (67Hz)
     notchGx.init(NOTCH_IDLE_FREQ_HZ, NOTCH_BANDWIDTH_HZ, (float)FLIGHT_CTRL_HZ);
     notchGy.init(NOTCH_IDLE_FREQ_HZ, NOTCH_BANDWIDTH_HZ, (float)FLIGHT_CTRL_HZ);
@@ -1533,16 +1579,10 @@ void setup()
     notchAz.init(NOTCH_IDLE_FREQ_HZ, NOTCH_BANDWIDTH_HZ, (float)FLIGHT_CTRL_HZ);
     Serial.println(F("[NOTCH] Filtros dinâmicos inicializados"));
 
-    // ── 9) Inicializar Subsistemas ──
+    // ── 10) Inicializar Subsistemas ──
     fsmManager.init();
     tecs.init();
     l1.init();
-
-    // ── 10) Inicializar FlightState ──
-    memset(&globalState, 0, sizeof(FlightState));
-    globalState.mode     = FlightMode::MODE_MANUAL;
-    globalState.armState = ArmState::DISARMED;
-    globalState.failsafe = FailsafeState::NOMINAL;
 
     // ── 11) Criar Mutex ──
     stateMutex = xSemaphoreCreateMutex();

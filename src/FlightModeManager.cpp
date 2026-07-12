@@ -209,6 +209,15 @@ bool FlightModeManager::runPreArmChecks(const FlightState& state)
         return false;
     }
 
+    // ════════════════════════════════════════════════════════
+    //  PRE-ARM CHECK 5: SAÚDE DO BARÔMETRO
+    // ════════════════════════════════════════════════════════
+    // O barômetro BMP280 deve estar saudável e inicializado.
+    if (!state.baro_healthy) {
+        _preArmFailReason = "Erro no Barometro (BMP280)";
+        return false;
+    }
+
     // ── Todos os checks passaram ──
     _preArmFailReason = "OK";
     return true;

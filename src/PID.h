@@ -87,7 +87,7 @@ private:
     
     // Estado interno
     float _integral;        // Acumulador integral
-    float _prevError;       // Erro anterior (para derivada)
+    float _prevMeasurement; // Medição anterior (S-02: derivar medição evita kick)
     float _dFiltered;       // Saída filtrada do termo D
     
     // Últimos termos calculados (para telemetria)
