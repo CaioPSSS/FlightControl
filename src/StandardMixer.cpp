@@ -36,16 +36,25 @@ MixerOutput StandardMixer::mix(float rollCmd, float pitchCmd, float throttleCmd)
     bool sat = false;
 
     // ════════════════════════════════════════════════════════
-    //  AILERONS — Atuação Diferencial Simétrica
+    //  AILERONS — Atuação Diferencial (1.5:1 ratio)
     // ════════════════════════════════════════════════════════
     // Aileron esquerdo: INVERTIDO em relação ao comando de roll.
     // Quando rollCmd > 0 (rolar direita):
     //   - Aileron esq SOBE (diminui sustentação asa esq) → PWM diminui
     //   - Aileron dir DESCE (aumenta sustentação asa dir) → PWM aumenta
-    out.ailLeftUs  = cmdToServoUs(-rollCmd, sat);  // Invertido
+    // Diferencial: deflexão para baixo multiplicada por 0.65f.
+    float leftAilCmd = -rollCmd;
+    if (leftAilCmd > 0.0f) {
+        leftAilCmd *= 0.65f;
+    }
+    out.ailLeftUs  = cmdToServoUs(leftAilCmd, sat);
     out.saturated |= sat;
     
-    out.ailRightUs = cmdToServoUs(rollCmd, sat);   // Direto
+    float rightAilCmd = rollCmd;
+    if (rightAilCmd > 0.0f) {
+        rightAilCmd *= 0.65f;
+    }
+    out.ailRightUs = cmdToServoUs(rightAilCmd, sat);
     out.saturated |= sat;
 
     // ════════════════════════════════════════════════════════

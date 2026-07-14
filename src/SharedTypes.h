@@ -201,6 +201,7 @@ extern volatile bool nvsFlushPending;
  */
 struct __attribute__((packed)) PacketUplinkLoRa_t {
     uint8_t  header;    // 0xBB
+    uint8_t  systemId;
     int16_t  roll;      // -1000..+1000
     int16_t  pitch;     // -1000..+1000
     uint16_t throttle;  // 0..1000
@@ -214,6 +215,7 @@ struct __attribute__((packed)) PacketUplinkLoRa_t {
  */
 struct __attribute__((packed)) PacketWaypointLoRa_t {
     uint8_t  header;    // 0xCC
+    uint8_t  systemId;
     uint8_t  index;     // Índice do waypoint na missão (0-255)
     int32_t  lat;       // Latitude × 1e7 (precisão ~1cm)
     int32_t  lon;       // Longitude × 1e7
@@ -227,6 +229,7 @@ struct __attribute__((packed)) PacketWaypointLoRa_t {
  */
 struct __attribute__((packed)) PacketTuningLoRa_t {
     uint8_t  header;    // 0xDD
+    uint8_t  systemId;
     uint8_t  paramId;   // ParamID enum
     float    value;     // Novo valor do parâmetro
 };
@@ -237,6 +240,7 @@ struct __attribute__((packed)) PacketTuningLoRa_t {
  */
 struct __attribute__((packed)) PacketTelemetryLoRa_t {
     uint8_t  header;      // 0xAA
+    uint8_t  systemId;
     int16_t  roll;        // Roll × 100 (centésimos de grau)
     int16_t  pitch;       // Pitch × 100
     int16_t  yaw;         // Yaw × 100
@@ -342,6 +346,9 @@ struct FlightState {
     
     // --- Velocidade inercial integrada (TECS anti-estol) ---
     float inertialSpeed_ms;  // Velocidade longitudinal integrada do acelerômetro
+    
+    // --- Earth Frame Acceleration Projection ---
+    float accelZ_world;      // Aceleração vertical projetada no frame da Terra
     
     // --- Flags de saturação do mixer (para anti-windup PID) ---
     bool mixerSaturated;

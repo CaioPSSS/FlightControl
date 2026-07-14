@@ -213,13 +213,10 @@ static void mpu6050Calibrate()
         Serial.println(F(" — NÃO MOVER..."));
 
         // ── Fase 1: Coleta de amostras ──
-        float sumGx = 0, sumGy = 0, sumGz = 0;
-        float sumAx = 0, sumAy = 0, sumAz = 0;
-
-        // Arrays para cálculo de desvio padrão (apenas giroscópio)
-        float samplesGx[NUM_SAMPLES];
-        float samplesGy[NUM_SAMPLES];
-        float samplesGz[NUM_SAMPLES];
+        float meanGx = 0.0f, M2Gx = 0.0f;
+        float meanGy = 0.0f, M2Gy = 0.0f;
+        float meanGz = 0.0f, M2Gz = 0.0f;
+        float sumAx = 0.0f, sumAy = 0.0f, sumAz = 0.0f;
 
         for (int i = 0; i < NUM_SAMPLES; i++) {
             uint8_t raw[14];
@@ -240,12 +237,21 @@ static void mpu6050Calibrate()
             float ay = (float)ay_raw / 8192.0f;
             float az = (float)az_raw / 8192.0f;
 
-            sumGx += gx; sumGy += gy; sumGz += gz;
             sumAx += ax; sumAy += ay; sumAz += az;
 
-            samplesGx[i] = gx;
-            samplesGy[i] = gy;
-            samplesGz[i] = gz;
+            // Algoritmo de Welford para média e variância online
+            float count = (float)(i + 1);
+            float dx = gx - meanGx;
+            meanGx += dx / count;
+            M2Gx += dx * (gx - meanGx);
+
+            float dy = gy - meanGy;
+            meanGy += dy / count;
+            M2Gy += dy * (gy - meanGy);
+
+            float dz = gz - meanGz;
+            meanGz += dz / count;
+            M2Gz += dz * (gz - meanGz);
 
             delay(2);  // ~500Hz amostragem
 
@@ -257,30 +263,15 @@ static void mpu6050Calibrate()
             }
         }
 
-        // ── Fase 2: Calcular médias ──
-        float meanGx = sumGx / NUM_SAMPLES;
-        float meanGy = sumGy / NUM_SAMPLES;
-        float meanGz = sumGz / NUM_SAMPLES;
+        // ── Fase 2: Calcular médias do acelerômetro ──
         float meanAx = sumAx / NUM_SAMPLES;
         float meanAy = sumAy / NUM_SAMPLES;
         float meanAz = sumAz / NUM_SAMPLES;
 
         // ── Fase 3: Calcular desvio padrão do giroscópio ──
-        // O desvio padrão indica QUANTO os valores variaram.
-        // Em repouso, o gyro tem ruído de ~0.05 dps (stddev).
-        // Se alguém está movendo o avião, stddev sobe para >5 dps.
-        float varGx = 0, varGy = 0, varGz = 0;
-        for (int i = 0; i < NUM_SAMPLES; i++) {
-            float dx = samplesGx[i] - meanGx;
-            float dy = samplesGy[i] - meanGy;
-            float dz = samplesGz[i] - meanGz;
-            varGx += dx * dx;
-            varGy += dy * dy;
-            varGz += dz * dz;
-        }
-        float stdGx = sqrtf(varGx / NUM_SAMPLES);
-        float stdGy = sqrtf(varGy / NUM_SAMPLES);
-        float stdGz = sqrtf(varGz / NUM_SAMPLES);
+        float stdGx = sqrtf(M2Gx / NUM_SAMPLES);
+        float stdGy = sqrtf(M2Gy / NUM_SAMPLES);
+        float stdGz = sqrtf(M2Gz / NUM_SAMPLES);
         float maxStd = fmaxf(stdGx, fmaxf(stdGy, stdGz));
 
         // ── Fase 4: Verificar aceleração total ≈ 1g (nivelada) ──
@@ -915,16 +906,23 @@ static void Task_FlightControl(void* pvParameters)
     float inertialSpeedInteg = 0.0f;
 
     while (true) {
+        // ── 0.5) MUTEX LOCK 1: COPY GLOBAL STATE & CLEAR REQUESTS ──
+        static FlightState localCopy;
+        bool gotMutex = false;
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+            localCopy = globalState;
+            globalState.request_failsafe = false;
+            globalState.new_pid_gains = false;
+            xSemaphoreGive(stateMutex);
+            gotMutex = true;
+        }
+
         // ── 0) ATUALIZAÇÃO DO NOTCH DINÂMICO (10Hz) ──
         if (++notchUpdateCounter >= NOTCH_UPDATE_DIVIDER) {
             notchUpdateCounter = 0;
-            float currentThrottle = 0.0f;
-            if (xSemaphoreTake(stateMutex, 0) == pdTRUE) {
-                // Se em modo automático, usar nav_throttle, senão rc_throttle
-                currentThrottle = globalState.mode >= FlightMode::MODE_AUTO ? 
-                                  globalState.nav_throttle : globalState.rc_throttle;
-                xSemaphoreGive(stateMutex);
-            }
+            // Se em modo automático, usar nav_throttle, senão rc_throttle
+            float currentThrottle = localCopy.mode >= FlightMode::MODE_AUTO ? 
+                                    localCopy.nav_throttle : localCopy.rc_throttle;
             float targetFreq = NOTCH_IDLE_FREQ_HZ + currentThrottle * (NOTCH_MAX_FREQ_HZ - NOTCH_IDLE_FREQ_HZ);
             notchGx.updateFrequency(targetFreq);
             notchGy.updateFrequency(targetFreq);
@@ -959,11 +957,7 @@ static void Task_FlightControl(void* pvParameters)
         // Em curva sustentada, o acelerômetro mede g + centrífuga.
         // a_centripetal = v × ω_yaw (simplificado para body frame)
         // Subtrair a componente centrífuga estimada do accel Y.
-        float groundSpeedLocal = 0.0f;
-        if (xSemaphoreTake(stateMutex, 0) == pdTRUE) {
-            groundSpeedLocal = globalState.groundSpeed_ms;
-            xSemaphoreGive(stateMutex);
-        }
+        float groundSpeedLocal = localCopy.groundSpeed_ms;
         // Correção centrífuga no eixo Y (lateral)
         // a_centripetal = V × ωz (taxa de yaw em rad/s × velocidade)
         float centripetal_g = groundSpeedLocal * gz_rad / GRAVITY;
@@ -973,6 +967,11 @@ static void Task_FlightControl(void* pvParameters)
                      ax_g, ay_corrected, az_g,
                      FLIGHT_CTRL_DT);
 
+        float vx = 2.0f * (q1 * q3 - q0 * q2);
+        float vy = 2.0f * (q0 * q1 + q2 * q3);
+        float vz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
+        float accelZ_world_local = ((ax_g * vx + ay_g * vy + az_g * vz) - 1.0f) * GRAVITY;
+
         float roll_deg, pitch_deg, yaw_deg;
         quaternionToEuler(roll_deg, pitch_deg, yaw_deg);
 
@@ -981,18 +980,13 @@ static void Task_FlightControl(void* pvParameters)
         // Quando voando acima de 5 m/s, o Course Over Ground (COG)
         // do GPS fornece a direção real de deslocamento.
         // Filtro complementar suave: mistura yaw inercial com COG.
-        float cogDegLocal = 0.0f;
-        float gsLocal = 0.0f;
-        if (xSemaphoreTake(stateMutex, 0) == pdTRUE) {
-            cogDegLocal = globalState.cogDeg;
-            gsLocal = globalState.groundSpeed_ms;
-            xSemaphoreGive(stateMutex);
-        }
+        float cogDegLocal = localCopy.cogDeg;
+        float gsLocal = localCopy.groundSpeed_ms;
 
         if (gsLocal > MIN_COG_FUSION_SPEED) {
             // Filtro complementar: τ ≈ 2s (suave para não oscilar)
             // O COG é ruidoso em voo turbulento, então usamos peso baixo.
-            constexpr float COG_ALPHA = 0.02f;  // ~2% por ciclo a 250Hz
+            constexpr float COG_ALPHA = 0.002f;  // ~0.2% por ciclo a 250Hz
             float yawError = wrapAngle180(cogDegLocal - yaw_deg);
             yaw_deg += COG_ALPHA * yawError;
             yaw_deg = wrapAngle360(yaw_deg);
@@ -1001,75 +995,32 @@ static void Task_FlightControl(void* pvParameters)
         // ── Integração de velocidade inercial (para TECS anti-estol) ──
         // Integrar aceleração longitudinal (eixo X body) para estimar
         // velocidade do avião sem depender do GPS.
-        // Decay exponencial para limitar drift (~5s time constant)
         float accelLongitudinal = ax_g * GRAVITY;  // m/s²
-        inertialSpeedInteg += accelLongitudinal * FLIGHT_CTRL_DT;
-        inertialSpeedInteg *= 0.998f;  // Decay (~2s time constant a 250Hz)
-
-        // ── Atualizar FlightState com dados do AHRS ──
-        FlightMode currentMode = FlightMode::MODE_MANUAL;
-        ArmState   currentArm  = ArmState::DISARMED;
-        float rcRoll = 0.0f, rcPitch = 0.0f, rcThrottle = 0.0f;
-        float navRollDeg = 0.0f, navPitchDeg = 0.0f, navThrottle = 0.0f;
-        bool  mixerWasSaturated = false;
-
-        bool needsFailsafeCheck = false;
-        bool needsPidUpdate = false;
-        FlightMode reqMode = FlightMode::MODE_MANUAL;
-        bool reqArm = false;
-
-        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-            globalState.roll_deg      = roll_deg;
-            globalState.pitch_deg     = pitch_deg;
-            globalState.yaw_deg       = yaw_deg;
-            globalState.gyro_roll_dps = gx_dps;
-            globalState.gyro_pitch_dps = gy_dps;
-            globalState.gyro_yaw_dps  = gz_dps;
-            globalState.accel_x       = ax_g * GRAVITY;
-            globalState.accel_y       = ay_g * GRAVITY;
-            globalState.accel_z       = az_g * GRAVITY;
-            globalState.inertialSpeed_ms = fabsf(inertialSpeedInteg);
-            
-            // Ler RC e modo (escritos pela Task_LoRa)
-            currentMode  = globalState.mode;
-            currentArm   = globalState.armState;
-            rcRoll       = globalState.rc_roll;
-            rcPitch      = globalState.rc_pitch;
-            rcThrottle   = globalState.rc_throttle;
-            navRollDeg   = globalState.nav_roll_deg;
-            navPitchDeg  = globalState.nav_pitch_deg;
-            navThrottle  = globalState.nav_throttle;
-            mixerWasSaturated = globalState.mixerSaturated;
-
-            // Ler requisições
-            needsFailsafeCheck = globalState.request_failsafe;
-            globalState.request_failsafe = false;
-
-            needsPidUpdate = globalState.new_pid_gains;
-            globalState.new_pid_gains = false;
-
-            reqMode = (FlightMode)globalState.requested_mode;
-            reqArm  = globalState.requested_arm;
-            
-            xSemaphoreGive(stateMutex);
+        if (gsLocal > 2.0f) {
+            inertialSpeedInteg = (inertialSpeedInteg * 0.995f) + (gsLocal * 0.005f);
         }
+        inertialSpeedInteg += accelLongitudinal * FLIGHT_CTRL_DT;
+
+        // Update localCopy fields for checkFailsafe and FSM update
+        localCopy.roll_deg      = roll_deg;
+        localCopy.pitch_deg     = pitch_deg;
+        localCopy.yaw_deg       = yaw_deg;
+        localCopy.gyro_roll_dps = gx_dps;
+        localCopy.gyro_pitch_dps = gy_dps;
+        localCopy.gyro_yaw_dps  = gz_dps;
+        localCopy.accel_x       = ax_g * GRAVITY;
+        localCopy.accel_y       = ay_g * GRAVITY;
+        localCopy.accel_z       = az_g * GRAVITY;
+        localCopy.inertialSpeed_ms = fabsf(inertialSpeedInteg);
 
         // ── PROCESSAR FLAGS DE REQUISIÇÃO (Core 0 -> Core 1) ──
+        bool needsFailsafeCheck = gotMutex ? localCopy.request_failsafe : false;
+        bool needsPidUpdate = gotMutex ? localCopy.new_pid_gains : false;
+
         if (needsFailsafeCheck) {
-            // P-17: Inicializar com zeros para evitar lixo de stack se o mutex falhar.
-            FlightState localStateFailsafe = {};
-            bool gotFailsafeState = false;
-            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-                localStateFailsafe = globalState;
-                gotFailsafeState = true;
-                xSemaphoreGive(stateMutex);
-            }
-            // Só executa a checagem se conseguimos uma cópia válida do estado.
-            if (gotFailsafeState) {
-                fsmManager.checkFailsafe(localStateFailsafe,
-                                         rollRatePID, pitchRatePID,
-                                         rollAnglePID, pitchAnglePID);
-            }
+            fsmManager.checkFailsafe(localCopy,
+                                     rollRatePID, pitchRatePID,
+                                     rollAnglePID, pitchAnglePID);
         }
 
         if (needsPidUpdate) {
@@ -1077,14 +1028,9 @@ static void Task_FlightControl(void* pvParameters)
         }
 
         // ── 5) FSM — Gerenciamento de Modo ──
-        // Copiar estado local para verificação da FSM
-        FlightState localState;
-        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-            localState = globalState;
-            xSemaphoreGive(stateMutex);
-        }
-
-        fsmManager.update(reqMode, reqArm, localState,
+        FlightMode reqMode = (FlightMode)localCopy.requested_mode;
+        bool reqArm  = localCopy.requested_arm;
+        fsmManager.update(reqMode, reqArm, localCopy,
                           rollRatePID, pitchRatePID,
                           rollAnglePID, pitchAnglePID);
 
@@ -1099,7 +1045,7 @@ static void Task_FlightControl(void* pvParameters)
         if (tpaBrkpt >= 0.99f) tpaBrkpt = 0.99f;
         float tpaFactor = 1.0f;
         // P-18: Usar throttle efetivo (navThr) nos modos autônomos, não o do stick
-        float actualThrottle = (activeMode >= FlightMode::MODE_HOLD) ? navThr : rcThrottle;
+        float actualThrottle = (activeMode >= FlightMode::MODE_HOLD) ? localCopy.nav_throttle : localCopy.rc_throttle;
         if (actualThrottle > tpaBrkpt) {
             // Atenuar Kp linearmente de 1.0 até 0.5 entre breakpoint e 100%
             tpaFactor = 1.0f - 0.5f * (actualThrottle - tpaBrkpt) / (1.0f - tpaBrkpt);
@@ -1109,17 +1055,17 @@ static void Task_FlightControl(void* pvParameters)
         switch (activeMode) {
             case FlightMode::MODE_MANUAL: {
                 // ── Bypass total: RC → Servo direto, sem PID ──
-                rollCmd  = rcRoll;
-                pitchCmd = rcPitch;
-                thrCmd   = rcThrottle;
+                rollCmd  = localCopy.rc_roll;
+                pitchCmd = localCopy.rc_pitch;
+                thrCmd   = localCopy.rc_throttle;
                 break;
             }
 
             case FlightMode::MODE_ANGLE: {
                 // ── Estabilizado: Piloto comanda ângulo, PID estabiliza ──
                 // RC normalizado [-1,+1] → ângulo alvo [±45°] (roll), [±30°] (pitch)
-                float rollTarget  = rcRoll * 45.0f;   // ±45° max roll
-                float pitchTarget = rcPitch * 30.0f;  // ±30° max pitch
+                float rollTarget  = localCopy.rc_roll * 45.0f;   // ±45° max roll
+                float pitchTarget = localCopy.rc_pitch * 30.0f;  // ±30° max pitch
 
                 // Angle loop (externo): erro de ângulo → taxa desejada (dps)
                 float rollRateTarget = rollAnglePID.update(
@@ -1130,12 +1076,12 @@ static void Task_FlightControl(void* pvParameters)
                 // Rate loop (interno): erro de taxa → comando servo
                 rollCmd = rollRatePID.update(
                     rollRateTarget, gx_dps, FLIGHT_CTRL_DT,
-                    tpaFactor, mixerWasSaturated);
+                    tpaFactor, localCopy.mixerSaturated);
                 pitchCmd = pitchRatePID.update(
                     pitchRateTarget, gy_dps, FLIGHT_CTRL_DT,
-                    tpaFactor, mixerWasSaturated);
+                    tpaFactor, localCopy.mixerSaturated);
 
-                thrCmd = rcThrottle;
+                thrCmd = localCopy.rc_throttle;
                 break;
             }
 
@@ -1143,10 +1089,10 @@ static void Task_FlightControl(void* pvParameters)
                 // ── Hold com override de piloto ──
                 // Se piloto move stick → comportamento ANGLE
                 // Se piloto não toca → L1/TECS controlam
-                if (FlightModeManager::isStickOverride(rcRoll, rcPitch)) {
+                if (FlightModeManager::isStickOverride(localCopy.rc_roll, localCopy.rc_pitch)) {
                     // Override: piloto tem controle (mesma lógica que ANGLE)
-                    float rollTarget  = rcRoll * 45.0f;
-                    float pitchTarget = rcPitch * 30.0f;
+                    float rollTarget  = localCopy.rc_roll * 45.0f;
+                    float pitchTarget = localCopy.rc_pitch * 30.0f;
 
                     float rollRateTarget = rollAnglePID.update(
                         rollTarget, roll_deg, FLIGHT_CTRL_DT);
@@ -1155,27 +1101,27 @@ static void Task_FlightControl(void* pvParameters)
 
                     rollCmd = rollRatePID.update(
                         rollRateTarget, gx_dps, FLIGHT_CTRL_DT,
-                        tpaFactor, mixerWasSaturated);
+                        tpaFactor, localCopy.mixerSaturated);
                     pitchCmd = pitchRatePID.update(
                         pitchRateTarget, gy_dps, FLIGHT_CTRL_DT,
-                        tpaFactor, mixerWasSaturated);
+                        tpaFactor, localCopy.mixerSaturated);
 
-                    thrCmd = rcThrottle;
+                    thrCmd = localCopy.rc_throttle;
                 } else {
                     // Navegação: L1/TECS controlam
                     float rollRateTarget = rollAnglePID.update(
-                        navRollDeg, roll_deg, FLIGHT_CTRL_DT);
+                        localCopy.nav_roll_deg, roll_deg, FLIGHT_CTRL_DT);
                     float pitchRateTarget = pitchAnglePID.update(
-                        navPitchDeg, pitch_deg, FLIGHT_CTRL_DT);
+                        localCopy.nav_pitch_deg, pitch_deg, FLIGHT_CTRL_DT);
 
                     rollCmd = rollRatePID.update(
                         rollRateTarget, gx_dps, FLIGHT_CTRL_DT,
-                        tpaFactor, mixerWasSaturated);
+                        tpaFactor, localCopy.mixerSaturated);
                     pitchCmd = pitchRatePID.update(
                         pitchRateTarget, gy_dps, FLIGHT_CTRL_DT,
-                        tpaFactor, mixerWasSaturated);
+                        tpaFactor, localCopy.mixerSaturated);
 
-                    thrCmd = navThrottle;
+                    thrCmd = localCopy.nav_throttle;
                 }
                 break;
             }
@@ -1184,18 +1130,18 @@ static void Task_FlightControl(void* pvParameters)
             case FlightMode::MODE_RTH: {
                 // ── Navegação autônoma: manche ignorado ──
                 float rollRateTarget = rollAnglePID.update(
-                    navRollDeg, roll_deg, FLIGHT_CTRL_DT);
+                    localCopy.nav_roll_deg, roll_deg, FLIGHT_CTRL_DT);
                 float pitchRateTarget = pitchAnglePID.update(
-                    navPitchDeg, pitch_deg, FLIGHT_CTRL_DT);
+                    localCopy.nav_pitch_deg, pitch_deg, FLIGHT_CTRL_DT);
 
                 rollCmd = rollRatePID.update(
                     rollRateTarget, gx_dps, FLIGHT_CTRL_DT,
-                    tpaFactor, mixerWasSaturated);
+                    tpaFactor, localCopy.mixerSaturated);
                 pitchCmd = pitchRatePID.update(
                     pitchRateTarget, gy_dps, FLIGHT_CTRL_DT,
-                    tpaFactor, mixerWasSaturated);
+                    tpaFactor, localCopy.mixerSaturated);
 
-                thrCmd = navThrottle;
+                thrCmd = localCopy.nav_throttle;
                 break;
             }
         }
@@ -1214,8 +1160,20 @@ static void Task_FlightControl(void* pvParameters)
                         mOut.elevatorUs, mOut.motorUs,
                         isArmed);
 
-        // ── Atualizar estado global com saídas e saturação ──
-        if (xSemaphoreTake(stateMutex, 0) == pdTRUE) {
+        // ── MUTEX LOCK 2: WRITE ALL COMPUTED VALUES ──
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+            globalState.roll_deg      = roll_deg;
+            globalState.pitch_deg     = pitch_deg;
+            globalState.yaw_deg       = yaw_deg;
+            globalState.gyro_roll_dps = gx_dps;
+            globalState.gyro_pitch_dps = gy_dps;
+            globalState.gyro_yaw_dps  = gz_dps;
+            globalState.accel_x       = ax_g * GRAVITY;
+            globalState.accel_y       = ay_g * GRAVITY;
+            globalState.accel_z       = az_g * GRAVITY;
+            globalState.inertialSpeed_ms = fabsf(inertialSpeedInteg);
+            globalState.accelZ_world   = accelZ_world_local;
+
             globalState.cmd_roll     = rollCmd;
             globalState.cmd_pitch    = pitchCmd;
             globalState.cmd_throttle = thrCmd;
@@ -1227,7 +1185,7 @@ static void Task_FlightControl(void* pvParameters)
         }
 
         // S-11: Alimenta o Watchdog de Hardware
-        esp_task_wdt_feed();
+        esp_task_wdt_reset();
 
         // ── Dormir até o próximo ciclo (250Hz timing preciso) ──
         vTaskDelayUntil(&xLastWakeTime, xPeriod);
@@ -1278,9 +1236,7 @@ static void Task_Navigation(void* pvParameters)
         float cogDeg = 0.0f;
 
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-            // Aceleração Z no body frame → world frame (simplificado)
-            // Para ângulos pequenos (~< 30°): az_world ≈ az_body - g
-            accelZ_world = globalState.accel_z - GRAVITY;
+            accelZ_world = globalState.accelZ_world;
             gsMs = globalState.groundSpeed_ms;
             inertialSpdMs = globalState.inertialSpeed_ms;
             curLat = globalState.gps_lat;
@@ -1370,7 +1326,7 @@ static void Task_Navigation(void* pvParameters)
         }
 
         // S-11: Alimenta o Watchdog de Hardware
-        esp_task_wdt_feed();
+        esp_task_wdt_reset();
 
         vTaskDelayUntil(&xLastWakeTime, xPeriod);
     }
@@ -1475,7 +1431,7 @@ static void Task_System_Mon(void* pvParameters)
         }
 
         // ── 2) Failsafe Watchdog ──
-        FlightState localState;
+        FlightState localState = {};
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             localState = globalState;
             globalState.request_failsafe = true;

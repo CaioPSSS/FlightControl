@@ -138,5 +138,6 @@
  C:/Users/souza/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src/Preferences.h \
  .pio/libdeps/esp32dev/TinyGPSPlus/src/TinyGPSPlus.h \
  .pio/libdeps/esp32dev/TinyGPSPlus/src/TinyGPS++.h src/SharedTypes.h \
+ C:/Users/souza/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_system/include/esp_task_wdt.h \
  src/PID.h src/FlightModeManager.h src/StandardMixer.h \
  src/OutputManager.h src/TECS.h src/L1_Guidance.h src/LoRaManager.h

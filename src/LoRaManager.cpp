@@ -47,7 +47,7 @@ bool LoRaManager::init()
 
     // ── Configuração RF otimizada para 10Hz bidirecional ──
     LoRa.setSpreadingFactor(7);     // SF7: menor latência
-    LoRa.setSignalBandwidth(125E3); // 125kHz: padrão
+    LoRa.setSignalBandwidth(250E3); // 250kHz
     LoRa.setCodingRate4(5);         // CR 4/5: mínimo FEC
     LoRa.setTxPower(17);           // 17 dBm (~50mW)
     LoRa.enableCrc();              // CRC habilitado (integridade)
@@ -57,7 +57,7 @@ bool LoRaManager::init()
 
     _lastRxMs = millis();  // Inicializar timestamp
 
-    Serial.println(F("[LORA] ✓ SX1278 inicializado — 433MHz, SF7, BW125"));
+    Serial.println(F("[LORA] ✓ SX1278 inicializado — 433MHz, SF7, BW250"));
     return true;
 }
 
@@ -78,7 +78,12 @@ void LoRaManager::processIncoming()
         buffer[idx++] = (uint8_t)LoRa.read();
     }
 
-    if (idx < 1) return;  // Pacote vazio
+    if (idx < 2) return;  // Pacote muito curto (deve conter pelo menos header + systemId)
+
+    // Rejeitar pacotes com systemId diferente de 0x42 (para 0xBB, 0xCC, 0xDD)
+    if (buffer[1] != 0x42) {
+        return;
+    }
 
     // ── Discriminar por header byte ──
     switch (buffer[0]) {
@@ -110,6 +115,7 @@ void LoRaManager::sendTelemetry()
 {
     PacketTelemetryLoRa_t pkt;
     pkt.header = 0xAA;
+    pkt.systemId = 0x42;
 
     // ── Ler estado global com mutex ──
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
