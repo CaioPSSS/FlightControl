@@ -9,9 +9,9 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 ## Regras Absolutas (Nunca Violar)
 
 ### Aeronave e Atuação
-- A aeronave é um **avião convencional**. **NÃO** implementar mixagem elevon, V-tail, ou qualquer mixagem cruzada.
+- A aeronave é um **avião convencional**.
 - O mapeamento é **direto (Direct Pass-Through)**:
-  - 2× Ailerons nas asas → controlam **ESTRITAMENTE** Roll.
+  - 2× Ailerons nas asas → controlam **ESTRITAMENTE** Roll (estabilizados com **aileron diferencial de proporção 1.5:1** para reduzir em 35% o arrasto de guinada adverso no aileron descendente).
   - 1× Profundor na cauda → controla **ESTRITAMENTE** Pitch.
   - Estabilizadores verticais são **FIXOS**. **Não existe leme (rudder).**
 - Hardware Alvo:
@@ -27,6 +27,7 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 - **Core 0**: Navegação (50Hz), GPS (async), LoRa (10Hz), System Monitor (1Hz).
 - **IPC**: Toda comunicação inter-tasks via `FlightState globalState` protegida por `stateMutex` (Mutex FreeRTOS).
 - **Regra de Mutabilidade Cruzada**: O Core 0 **NUNCA** deve chamar métodos que alterem o estado de objetos processados pelo Core 1 (como reset de PIDs ou atualizações diretas da FSM).
+- **Otimização de Transações Mutex**: Para minimizar a contenção e jitter, a `Task_FlightControl` realiza apenas **duas transações contíguas com o mutex por ciclo** (uma cópia contígua no início do ciclo e uma escrita contígua ao final do ciclo para telemetria).
 - **Flags de Requisição**: A comunicação inter-núcleos baseia-se em *event flags* (`request_failsafe`, `new_pid_gains`, `requested_mode`, `requested_arm`). O Core 0 apenas altera estas flags no `FlightState`. O Core 1 (`Task_FlightControl`) lê estas flags e executa as ações necessárias sincronamente em sua malha.
 - Padrão de acesso ao estado global:
   ```cpp
@@ -50,7 +51,7 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 | MPU6050 (IMU) | SDA=21, SCL=22 | I2C Fast 400kHz (Core 1) |
 | BMP280 (Baro) | SDA=32, SCL=33 | I2C Slow 400kHz (Core 0) |
 | GPS NEO-6M | RX=16, TX=17 | UART2, 9600 baud |
-| LoRa SX1278 | SCK=18, MISO=19, MOSI=23, CS=5, RST=14, DIO0=26 | SPI, 433MHz |
+| LoRa SX1278 | SCK=18, MISO=19, MOSI=23, CS=5, RST=14, DIO0=26 | SPI, 433MHz, **BW 250kHz** |
 | Aileron Esq | Pino 13 | LEDC CH0, 50Hz, 14-bit |
 | Aileron Dir | Pino 12 | LEDC CH1 |
 | Profundor | Pino 15 | LEDC CH2 |
@@ -69,7 +70,7 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 ### Estilo
 - Prefixo `_` para membros privados de classe (ex: `_kp`, `_integral`).
 - `static constexpr` para constantes de hardware e limites físicos.
-- Structs de pacotes LoRa: `__attribute__((packed))` obrigatório (sem padding).
+- Structs de pacotes LoRa: `__attribute__((packed))` obrigatório (sem padding) e incorporando o `systemId = 0x42` após o header.
 - Enums tipados (`enum class`) para modos, estados e IDs de parâmetros.
 
 ### Unidades Físicas
@@ -99,13 +100,15 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 
 ### AHRS
 - Filtro de **Mahony** (quaternion) com correção de **força centrífuga** em curvas.
-- **COG Yaw Fusion**: filtro complementar suave (α=0.02) com GPS Course Over Ground quando velocidade > 5 m/s. Sem magnetômetro.
-- **Notch Filter Dinâmico**: Filtro biquad IIR com frequência central adaptativa. Rastreia o throttle para estimar a RPM do motor e rejeitar a frequência exata de vibração (50Hz a 170Hz para o combo A2212 1000KV/1045 em 2S).
-- **Auto-calibração Robusta**: Ocorre no boot com 500 amostras. Utiliza análise de desvio padrão (stddev) para detecção de movimento, rejeitando amostras corrompidas e executando _retry_ caso a aeronave seja sacudida pelo piloto.
+- **COG Yaw Fusion**: filtro complementar com GPS Course Over Ground ajustado com `COG_ALPHA = 0.002f` para garantir constante de tempo real de **2.0 segundos** sem oscilações de ruído.
+- **Notch Filter Dinâmico**: Filtro biquad IIR com frequência central adaptativa. Rastreia o throttle real do VANT (utilizando `actualThrottle` derivado de comandos manuais ou do TECS dependendo do modo ativo) para filtrar as vibrações do motor.
+- **Auto-calibração Robusta**: Ocorre no boot com 500 amostras e **sem alocação de buffers na stack** (utiliza o algoritmo de Welford online para desvio padrão e média), prevenindo estouro de pilha.
 
 ### Navegação
 - **L1 Guidance**: aceleração lateral `a_lat = 2·V²/L1·sin(η)`, roll clampado a **±35°** (proteção tip stall).
-- **TECS Híbrido**: detecção de estol por **confirmação dupla** (GPS ground speed + velocidade inercial integrada). Histerese em 9.5 m/s.
+- **TECS Híbrido**: detecção de estol por **confirmação dupla**. Para evitar o decaimento assintótico a zero em cruzeiro contínuo, a velocidade inercial integrada do acelerômetro é misturada com a velocidade do solo do GPS (quando gsLocal > 2.0 m/s) via fusão complementar.
+- **Aceleração Vertical Real (Z World)**: Calculada de forma robusta projetando as acelerações tridimensionais no referencial da Terra com o Quaternion atitudinal (eliminando os termos centrífugos e de inclinação da gravidade):
+  $$\text{accelZ\_world} = (a_x \cdot v_x + a_y \cdot v_y + a_z \cdot v_z) - g$$
 - **Kalman 1D**: fusão barômetro + acelerômetro para altitude.
 
 ### FSM e Segurança
@@ -119,10 +122,10 @@ Firmware de controlador de voo para **VANT convencional (Tractor) com cauda de l
 
 | Header | Direção | Struct | Conteúdo |
 |--------|---------|--------|----------|
-| `0xBB` | Uplink | `PacketUplinkLoRa_t` | RC: roll±1000, pitch±1000, thr 0-1000, mode, arm |
-| `0xCC` | Uplink | `PacketWaypointLoRa_t` | Waypoint: index, lat×1e7, lon×1e7, alt(dm), speed(cm/s) |
-| `0xDD` | Uplink | `PacketTuningLoRa_t` | Tuning: ParamID + float value |
-| `0xAA` | Downlink | `PacketTelemetryLoRa_t` | Telemetria completa a 10Hz |
+| `0xBB` | Uplink | `PacketUplinkLoRa_t` | RC: roll±1000, pitch±1000, thr 0-1000, mode, arm (10 bytes total, inclui systemId=0x42) |
+| `0xCC` | Uplink | `PacketWaypointLoRa_t` | Waypoint: index, lat×1e7, lon×1e7, alt(dm), speed(cm/s) (15 bytes total, inclui systemId=0x42) |
+| `0xDD` | Uplink | `PacketTuningLoRa_t` | Tuning: ParamID + float value (7 bytes total, inclui systemId=0x42) |
+| `0xAA` | Downlink | `PacketTelemetryLoRa_t` | Telemetria completa a 10Hz (27 bytes total, inclui systemId=0x42) |
 
 ---
 

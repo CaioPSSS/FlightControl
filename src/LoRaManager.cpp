@@ -30,8 +30,13 @@
 
 LoRaManager::LoRaManager()
     : _lastRSSI(0),
-      _lastRxMs(0)
+      _lastRxMs(0),
+      _uploadState(STATE_IDLE),
+      _wpCountExpected(0),
+      _wpCountReceived(0),
+      _telemetryDivider(0)
 {
+    memset(_uploadBuffer, 0, sizeof(_uploadBuffer));
 }
 
 bool LoRaManager::init()
@@ -93,6 +98,9 @@ void LoRaManager::processIncoming()
         case 0xCC:
             handleWaypoint(buffer, idx);
             break;
+        case 0xCE:
+            handleMissionControl(buffer, idx);
+            break;
         case 0xDD:
             handleTuning(buffer, idx);
             break;
@@ -113,6 +121,16 @@ void LoRaManager::processIncoming()
 
 void LoRaManager::sendTelemetry()
 {
+    if (_uploadState == STATE_UPLOADING) {
+        _telemetryDivider++;
+        if (_telemetryDivider < 10) {
+            return;
+        }
+        _telemetryDivider = 0;
+    } else {
+        _telemetryDivider = 0;
+    }
+
     PacketTelemetryLoRa_t pkt;
     pkt.header = 0xAA;
     pkt.systemId = 0x42;
@@ -201,25 +219,127 @@ void LoRaManager::handleWaypoint(const uint8_t* data, int len)
         return;
     }
 
-    // ── Converter e armazenar com mutex ──
-    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-        FlightState::Waypoint& wp = globalState.waypoints[pkt->index];
-        wp.lat      = (double)pkt->lat / 1e7;         // int32 × 1e7 → graus
-        wp.lon      = (double)pkt->lon / 1e7;
-        wp.alt_m    = (float)pkt->alt / 10.0f;        // decímetros → metros
-        wp.speed_ms = (float)pkt->speed / 100.0f;     // cm/s → m/s
-        wp.valid    = true;
+    if (_uploadState == STATE_UPLOADING) {
+        _uploadBuffer[pkt->index] = *pkt;
+        _wpCountReceived++;
+        // Reply ACK 0xCE (cmd=3, data1=index) to the GCS
+        sendMissionControl(3, pkt->index, 0);
+        Serial.print(F("[LORA] Buffer WP "));
+        Serial.print(pkt->index);
+        Serial.println(F(" stored"));
+    } else {
+        Serial.println(F("[LORA] WP received outside UPLOADING state"));
+    }
+}
 
-        // Atualizar contador de waypoints
-        if (pkt->index >= globalState.wp_count) {
-            globalState.wp_count = pkt->index + 1;
-        }
-        xSemaphoreGive(stateMutex);
+void LoRaManager::sendMissionControl(uint8_t cmd, uint8_t data1, uint32_t checksum)
+{
+    PacketMissionControlLoRa_t pkt;
+    pkt.header = 0xCE;
+    pkt.systemId = 0x42;
+    pkt.cmd = cmd;
+    pkt.data1 = data1;
+    pkt.checksum = checksum;
+    pkt._unused = 0;
+
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*)&pkt, sizeof(pkt));
+    LoRa.endPacket(true); // async (non-blocking TX)
+}
+
+void LoRaManager::handleMissionControl(const uint8_t* data, int len)
+{
+    if (len < (int)sizeof(PacketMissionControlLoRa_t)) {
+        Serial.println(F("[LORA] Pacote MissionControl truncado"));
+        return;
     }
 
-    Serial.print(F("[LORA] WP "));
-    Serial.print(pkt->index);
-    Serial.println(F(" recebido"));
+    const PacketMissionControlLoRa_t* pkt = (const PacketMissionControlLoRa_t*)data;
+
+    switch (pkt->cmd) {
+        case 1: { // START_UPLOAD
+            memset(_uploadBuffer, 0, sizeof(_uploadBuffer));
+            _uploadState = STATE_UPLOADING;
+            _wpCountExpected = pkt->data1;
+            _wpCountReceived = 0;
+            uint8_t count = pkt->data1;
+            sendMissionControl(3, count, 0); // reply ACK
+            Serial.print(F("[LORA] START_UPLOAD received. Expected: "));
+            Serial.println(_wpCountExpected);
+            break;
+        }
+        case 2: { // VERIFY_CHECKSUM
+            if (_wpCountReceived != _wpCountExpected) {
+                Serial.print(F("[LORA] VERIFY_CHECKSUM failed: count mismatch. Received: "));
+                Serial.print(_wpCountReceived);
+                Serial.print(F(", Expected: "));
+                Serial.println(_wpCountExpected);
+                sendMissionControl(4, 0, 0); // reply NACK
+                _uploadState = STATE_IDLE;
+            } else {
+                uint32_t computedChecksum = 0;
+                for (uint8_t i = 0; i < _wpCountExpected; i++) {
+                    const uint8_t* wpBytes = (const uint8_t*)&_uploadBuffer[i];
+                    for (size_t j = 0; j < sizeof(PacketWaypointLoRa_t); j++) {
+                        computedChecksum += wpBytes[j];
+                    }
+                }
+                if (computedChecksum == pkt->checksum) {
+                    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        for (int i = 0; i < FlightState::MAX_WAYPOINTS; i++) {
+                            globalState.waypoints[i].valid = false;
+                        }
+                        for (uint8_t i = 0; i < _wpCountExpected; i++) {
+                            const PacketWaypointLoRa_t& uploadWp = _uploadBuffer[i];
+                            FlightState::Waypoint& wp = globalState.waypoints[i];
+                            wp.lat      = (double)uploadWp.lat / 1e7;
+                            wp.lon      = (double)uploadWp.lon / 1e7;
+                            wp.alt_m    = (float)uploadWp.alt / 10.0f;
+                            wp.speed_ms = (float)uploadWp.speed / 100.0f;
+                            wp.cmd      = uploadWp.cmd;
+                            wp.cmd_val  = uploadWp.cmd_val;
+                            wp.valid    = true;
+                        }
+                        globalState.wp_count = _wpCountExpected;
+                        globalState.wp_current = 0;
+                        xSemaphoreGive(stateMutex);
+                    }
+                    nvsMissionFlushPending = true;
+                    sendMissionControl(3, 0xFF, computedChecksum); // reply ACK
+                    _uploadState = STATE_IDLE;
+                    Serial.println(F("[LORA] VERIFY_CHECKSUM success. Mission committed."));
+                } else {
+                    Serial.print(F("[LORA] VERIFY_CHECKSUM failed: checksum mismatch. Calc: "));
+                    Serial.print(computedChecksum);
+                    Serial.print(F(", Pkt: "));
+                    Serial.println(pkt->checksum);
+                    sendMissionControl(4, 0, 0); // reply NACK
+                    _uploadState = STATE_IDLE;
+                }
+            }
+            break;
+        }
+        case 5: { // CLEAR
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                for (int i = 0; i < FlightState::MAX_WAYPOINTS; i++) {
+                    globalState.waypoints[i].valid = false;
+                }
+                globalState.wp_count = 0;
+                globalState.wp_current = 0;
+                xSemaphoreGive(stateMutex);
+            }
+            nvsMissionFlushPending = true;
+            sendMissionControl(3, 0xFF, 0); // reply ACK
+            _uploadState = STATE_IDLE;
+            Serial.println(F("[LORA] Mission CLEAR processed"));
+            break;
+        }
+        default: {
+            Serial.print(F("[LORA] MissionControl cmd desconhecido: "));
+            Serial.println(pkt->cmd);
+            break;
+        }
+    }
 }
 
 void LoRaManager::handleTuning(const uint8_t* data, int len)

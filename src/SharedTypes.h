@@ -187,6 +187,8 @@ extern float paramValues[];
 
 // Flag indicando que há parâmetros pendentes de gravação NVS
 extern volatile bool nvsFlushPending;
+extern volatile bool nvsMissionFlushPending;
+
 
 // ============================================================
 //  ESTRUTURAS DE PACOTES LORA (Binárias, packed, sem padding)
@@ -215,12 +217,23 @@ struct __attribute__((packed)) PacketUplinkLoRa_t {
  */
 struct __attribute__((packed)) PacketWaypointLoRa_t {
     uint8_t  header;    // 0xCC
-    uint8_t  systemId;
-    uint8_t  index;     // Índice do waypoint na missão (0-255)
-    int32_t  lat;       // Latitude × 1e7 (precisão ~1cm)
-    int32_t  lon;       // Longitude × 1e7
-    int16_t  alt;       // Altitude em decímetros (±3276.7m)
-    uint16_t speed;     // Velocidade alvo em cm/s
+    uint8_t  systemId;  // 0x42
+    uint8_t  index;     // Index of waypoint (0..31)
+    int32_t  lat;       // Latitude * 1e7
+    int32_t  lon;       // Longitude * 1e7
+    int16_t  alt;       // Target relative altitude in decimeters
+    uint16_t speed;     // Target speed in cm/s
+    uint8_t  cmd;       // Command type: 0=WAYPOINT, 1=LOITER_TIME, 2=RTL
+    uint16_t cmd_val;   // Command value (e.g. loiter time in seconds)
+};
+
+struct __attribute__((packed)) PacketMissionControlLoRa_t {
+    uint8_t  header;    // 0xCE
+    uint8_t  systemId;  // 0x42
+    uint8_t  cmd;       // 1=START_UPLOAD, 2=VERIFY_CHECKSUM, 3=ACK, 4=NACK, 5=CLEAR
+    uint8_t  data1;     // e.g. wp_count or waypoint index
+    uint32_t checksum;  // Simple checksum (sum of all waypoints' data)
+    uint8_t  _unused;   // Unused padding to guarantee 9-byte layout
 };
 
 /**
@@ -315,6 +328,8 @@ struct FlightState {
         double lon;
         float  alt_m;
         float  speed_ms;
+        uint8_t cmd;
+        uint16_t cmd_val;
         bool   valid;
     };
     Waypoint waypoints[MAX_WAYPOINTS];
@@ -335,6 +350,8 @@ struct FlightState {
     float nav_roll_deg;   // Comando de roll do L1 (graus)
     float nav_pitch_deg;  // Comando de pitch do TECS (graus)
     float nav_throttle;   // Comando de throttle do TECS (0-1)
+    float xtrack_error;
+    float alt_error;
     
     // --- Sistema ---
     float    vbat_V;         // Tensão da bateria (Volts)

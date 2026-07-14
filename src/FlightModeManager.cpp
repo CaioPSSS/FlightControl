@@ -29,7 +29,9 @@ FlightModeManager::FlightModeManager()
       _previousMode(FlightMode::MODE_MANUAL),
       _armState(ArmState::DISARMED),
       _failsafeState(FailsafeState::NOMINAL),
-      _preArmFailReason("Não verificado")
+      _preArmFailReason("Não verificado"),
+      _lastXTrackOkMs(0),
+      _lastAltOkMs(0)
 {
 }
 
@@ -40,6 +42,8 @@ void FlightModeManager::init()
     _armState       = ArmState::DISARMED;
     _failsafeState  = FailsafeState::NOMINAL;
     _preArmFailReason = "Aguardando ARM";
+    _lastXTrackOkMs = 0;
+    _lastAltOkMs = 0;
     Serial.println(F("[FSM] Inicializado: DISARMED / MANUAL"));
 }
 
@@ -75,6 +79,12 @@ void FlightModeManager::update(FlightMode requestedMode, bool requestArm,
     //  2) TRANSIÇÃO DE MODO (só se armado)
     // ════════════════════════════════════════════════════════
     if (_armState == ArmState::ARMED) {
+        if ((_failsafeState == FailsafeState::CRITICAL || _failsafeState == FailsafeState::WARN) && _currentMode == FlightMode::MODE_RTH) {
+            if (requestedMode == FlightMode::MODE_AUTO) {
+                return;
+            }
+        }
+
         // Não permitir mudança de modo durante failsafe crítico
         // (o failsafe já forçou RTH, piloto precisa desarmar)
         if (_failsafeState == FailsafeState::CRITICAL &&
@@ -160,6 +170,65 @@ void FlightModeManager::checkFailsafe(const FlightState& state,
             Serial.print(F("[FAILSAFE] ⚠ Vbat CRÍTICO: "));
             Serial.print(state.vbat_V, 1);
             Serial.println(F("V → RTH"));
+        }
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  FAILSAFE: NAVEGAÇÃO AUTÔNOMA E ERROS (Milestone 3)
+    // ════════════════════════════════════════════════════════
+    bool otherFailsafeActive = (elapsed > loraTimeout) || (state.vbat_V > 0.5f && state.vbat_V < VBAT_CRITICAL_INFLIGHT);
+
+    if (_currentMode != FlightMode::MODE_AUTO) {
+        _lastXTrackOkMs = millis();
+        _lastAltOkMs = millis();
+        if (!otherFailsafeActive) {
+            _failsafeState = FailsafeState::NOMINAL;
+        }
+    } else {
+        // GPS Loss in AUTO
+        if (!state.gps_fix || state.gps_sats < 4) {
+            _failsafeState = FailsafeState::CRITICAL;
+            _previousMode = _currentMode;
+            _currentMode = FlightMode::MODE_RTH;
+            bumplessTransfer(rollRatePID, pitchRatePID, rollAnglePID, pitchAnglePID);
+            Serial.println(F("[FAILSAFE] ⚠ CRÍTICO — Perda de GPS em AUTO → RTH"));
+            return;
+        }
+
+        // Cross-Track Error in AUTO
+        bool xtrackOk = fabsf(state.xtrack_error) <= 50.0f;
+        if (xtrackOk) {
+            _lastXTrackOkMs = millis();
+        } else {
+            if (millis() - _lastXTrackOkMs > 5000) {
+                _failsafeState = FailsafeState::WARN;
+                _previousMode = _currentMode;
+                _currentMode = FlightMode::MODE_RTH;
+                bumplessTransfer(rollRatePID, pitchRatePID, rollAnglePID, pitchAnglePID);
+                Serial.println(F("[FAILSAFE] ⚠ WARN — Erro Cross-Track > 50m por 5s → RTH"));
+                return;
+            }
+        }
+
+        // Altitude Error in AUTO
+        bool altOk = fabsf(state.alt_error) <= 15.0f;
+        if (altOk) {
+            _lastAltOkMs = millis();
+        } else {
+            if (millis() - _lastAltOkMs > 5000) {
+                _failsafeState = FailsafeState::WARN;
+                _previousMode = _currentMode;
+                _currentMode = FlightMode::MODE_RTH;
+                bumplessTransfer(rollRatePID, pitchRatePID, rollAnglePID, pitchAnglePID);
+                Serial.println(F("[FAILSAFE] ⚠ WARN — Erro Altitude > 15m por 5s → RTH"));
+                return;
+            }
+        }
+
+        if (xtrackOk && altOk) {
+            if (!otherFailsafeActive) {
+                _failsafeState = FailsafeState::NOMINAL;
+            }
         }
     }
 }

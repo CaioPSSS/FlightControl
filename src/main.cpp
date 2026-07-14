@@ -65,6 +65,7 @@ const ParamMeta PARAM_TABLE[] = {
 
 float paramValues[(uint8_t)ParamID::PARAM_COUNT];
 volatile bool nvsFlushPending = false;
+volatile bool nvsMissionFlushPending = false;
 
 // ── NVS / Preferences ──
 Preferences preferences;
@@ -819,6 +820,48 @@ static void saveParamsToNVS()
     Serial.println(F("[NVS] Parâmetros salvos na Flash"));
 }
 
+static void loadMissionFromNVS()
+{
+    preferences.begin("VANT_MISSION", true);
+    uint8_t count = preferences.getUChar("wp_count", 0);
+    if (count > 0 && count <= FlightState::MAX_WAYPOINTS) {
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            memset(globalState.waypoints, 0, sizeof(globalState.waypoints));
+            size_t bytesRead = preferences.getBytes("mission", globalState.waypoints, sizeof(globalState.waypoints));
+            if (bytesRead > 0) {
+                globalState.wp_count = count;
+                Serial.print(F("[NVS] Mission loaded: "));
+                Serial.print(count);
+                Serial.println(F(" waypoints"));
+            } else {
+                globalState.wp_count = 0;
+                Serial.println(F("[NVS] Mission read failed or empty"));
+            }
+            xSemaphoreGive(stateMutex);
+        }
+    } else {
+        Serial.println(F("[NVS] No saved mission found or invalid count"));
+    }
+    preferences.end();
+}
+
+static void saveMissionToNVS()
+{
+    preferences.begin("VANT_MISSION", false);
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        preferences.putBytes("mission", globalState.waypoints, sizeof(globalState.waypoints));
+        preferences.putUChar("wp_count", globalState.wp_count);
+        nvsMissionFlushPending = false;
+        Serial.print(F("[NVS] Mission saved to Flash: "));
+        Serial.print(globalState.wp_count);
+        Serial.println(F(" waypoints"));
+        xSemaphoreGive(stateMutex);
+    } else {
+        Serial.println(F("[NVS] Failed to take mutex to save mission"));
+    }
+    preferences.end();
+}
+
 /**
  * Aplica os valores de paramValues[] aos controladores PID.
  * Chamado após carregar NVS e após receber tuning via LoRa.
@@ -1207,6 +1250,9 @@ static void Task_Navigation(void* pvParameters)
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xPeriod = pdMS_TO_TICKS(1000 / NAV_HZ);  // 20ms
 
+    static uint32_t loiterStartMs = 0;
+    static uint8_t lastWpCurrent = 0;
+
     while (true) {
         // ── Ler BMP280 ──
         float temp, press;
@@ -1257,6 +1303,11 @@ static void Task_Navigation(void* pvParameters)
             xSemaphoreGive(stateMutex);
         }
 
+        if (wpCurrent != lastWpCurrent || curMode != FlightMode::MODE_AUTO) {
+            loiterStartMs = 0;
+            lastWpCurrent = wpCurrent;
+        }
+
         // ── Kalman 1D — Fusão Baro + Accel ──
         kalmanAltUpdate(relAlt, accelZ_world, NAV_DT);
 
@@ -1278,27 +1329,60 @@ static void Task_Navigation(void* pvParameters)
                                           gsMs, cogDeg);
                 targetAlt = homeAlt + 30.0f;  // 30m acima de Home (baro reference)
             } else if (curMode == FlightMode::MODE_AUTO && wpTarget.valid) {
-                // ── AUTO: seguir waypoints ──
-                double prevLatUse = wpPrev.valid ? wpPrev.lat : curLat;
-                double prevLonUse = wpPrev.valid ? wpPrev.lon : curLon;
+                // ── AUTO: seguir/orbitar/retornar conforme cmd ──
+                if (wpTarget.cmd == 0) {
+                    // ── WAYPOINT ──
+                    double prevLatUse = wpPrev.valid ? wpPrev.lat : curLat;
+                    double prevLonUse = wpPrev.valid ? wpPrev.lon : curLon;
 
-                navRoll = l1.update(curLat, curLon,
-                                    wpTarget.lat, wpTarget.lon,
-                                    prevLatUse, prevLonUse,
-                                    gsMs, cogDeg);
+                    navRoll = l1.update(curLat, curLon,
+                                        wpTarget.lat, wpTarget.lon,
+                                        prevLatUse, prevLonUse,
+                                        gsMs, cogDeg);
 
-                targetAlt = wpTarget.alt_m;
-                targetSpd = wpTarget.speed_ms;
+                    targetAlt = wpTarget.alt_m;
+                    targetSpd = wpTarget.speed_ms;
 
-                // Verificar se waypoint alcançado
-                if (l1.waypointReached(curLat, curLon,
-                                       wpTarget.lat, wpTarget.lon, 30.0f)) {
-                    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-                        // P-22: Guard contra wp_count = 0 (underflow)
-                        if (globalState.wp_count > 0 && globalState.wp_current < globalState.wp_count - 1) {
-                            globalState.wp_current++;
+                    // Verificar se waypoint alcançado
+                    if (l1.waypointReached(curLat, curLon,
+                                           wpTarget.lat, wpTarget.lon, 30.0f)) {
+                        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+                            if (globalState.wp_count > 0 && globalState.wp_current < globalState.wp_count - 1) {
+                                globalState.wp_current++;
+                            }
+                            xSemaphoreGive(stateMutex);
                         }
-                        // Se último WP, manter loiter no ponto
+                    }
+                } else if (wpTarget.cmd == 1) {
+                    // ── LOITER_TIME ──
+                    navRoll = l1.updateLoiter(curLat, curLon,
+                                              wpTarget.lat, wpTarget.lon,
+                                              50.0f,  // orbit radius
+                                              gsMs, cogDeg);
+
+                    targetAlt = wpTarget.alt_m;
+                    targetSpd = wpTarget.speed_ms;
+
+                    bool withinAcceptance = l1.waypointReached(curLat, curLon, wpTarget.lat, wpTarget.lon, 30.0f);
+                    if (withinAcceptance && loiterStartMs == 0) {
+                        loiterStartMs = millis();
+                    }
+                    if (loiterStartMs != 0) {
+                        uint32_t loiterDurationMs = (uint32_t)wpTarget.cmd_val * 1000;
+                        if (millis() - loiterStartMs >= loiterDurationMs) {
+                            loiterStartMs = 0;
+                            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+                                if (globalState.wp_count > 0 && globalState.wp_current < globalState.wp_count - 1) {
+                                    globalState.wp_current++;
+                                }
+                                xSemaphoreGive(stateMutex);
+                            }
+                        }
+                    }
+                } else if (wpTarget.cmd == 2) {
+                    // ── RTL (RTH) ──
+                    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+                        globalState.requested_mode = (uint8_t)FlightMode::MODE_RTH;
                         xSemaphoreGive(stateMutex);
                     }
                 }
@@ -1315,6 +1399,17 @@ static void Task_Navigation(void* pvParameters)
                         navPitch, navThr);
         }
 
+        // ── Calcular erros de navegação lateral/altitude ──
+        float xtrackErr = 0.0f;
+        float altErr = 0.0f;
+        if (curMode == FlightMode::MODE_AUTO && wpTarget.valid) {
+            xtrackErr = l1.getLastCrossTrackError();
+            altErr = kalman_alt - wpTarget.alt_m;
+        } else {
+            xtrackErr = 0.0f;
+            altErr = 0.0f;
+        }
+
         // ── Atualizar estado global com resultados de navegação ──
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
             globalState.altitude_m     = kalman_alt;
@@ -1322,6 +1417,8 @@ static void Task_Navigation(void* pvParameters)
             globalState.nav_roll_deg   = navRoll;
             globalState.nav_pitch_deg  = navPitch;
             globalState.nav_throttle   = navThr;
+            globalState.xtrack_error   = xtrackErr;
+            globalState.alt_error      = altErr;
             xSemaphoreGive(stateMutex);
         }
 
@@ -1446,6 +1543,9 @@ static void Task_System_Mon(void* pvParameters)
         if (nvsFlushPending) {
             saveParamsToNVS();
         }
+        if (nvsMissionFlushPending) {
+            saveMissionToNVS();
+        }
 
         // ── 4) Heartbeat serial (debug) ──
         Serial.print(F("[MON] Vbat="));
@@ -1523,6 +1623,7 @@ void setup()
 
     // ── 8) Inicializar NVS — Carregar parâmetros persistidos ──
     loadParamsFromNVS();
+    loadMissionFromNVS();
     applyParamsToPIDs();
 
     // ── 9) Inicializar Filtros Notch Dinâmicos (BW=25Hz, Fs=250Hz) ──

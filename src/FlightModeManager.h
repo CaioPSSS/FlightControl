@@ -103,6 +103,8 @@ private:
     ArmState      _armState;
     FailsafeState _failsafeState;
     const char*   _preArmFailReason;
+    uint32_t      _lastXTrackOkMs;
+    uint32_t      _lastAltOkMs;
 
     /**
      * Executa TODOS os Pre-Arm Checks.

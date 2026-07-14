@@ -88,4 +88,17 @@ private:
      * Aplica novo valor ao parâmetro em RAM e seta flag NVS.
      */
     void handleTuning(const uint8_t* data, int len);
+
+    // Private FSM state variables for uploading
+    enum UploadState { STATE_IDLE = 0, STATE_UPLOADING = 1 };
+    UploadState _uploadState;
+    uint8_t _wpCountExpected;
+    uint8_t _wpCountReceived;
+    uint8_t _telemetryDivider;
+    PacketWaypointLoRa_t _uploadBuffer[FlightState::MAX_WAYPOINTS];
+
+    // Private helpers
+    void handleMissionControl(const uint8_t* data, int len);
+    void sendMissionControl(uint8_t cmd, uint8_t data1, uint32_t checksum);
 };
+
